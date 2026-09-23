@@ -1,0 +1,10 @@
+{
+  "name": "Timesheet Fortia (demo)",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:22",
+  "postCreateCommand": "npm install && npm run seed -- --reset",
+  "postAttachCommand": "npm start",
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": { "label": "Timesheet Fortia", "onAutoForward": "openBrowser" }
+  }
+}

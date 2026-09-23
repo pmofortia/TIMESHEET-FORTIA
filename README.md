@@ -4,6 +4,17 @@ Sistema web para que los consultores de Fortia registren sus horas **por semana*
 tareas que tienen asignadas en **Microsoft Project**, con flujo de aprobación e indicadores de
 **cargabilidad** y distribución de horas por rubro.
 
+## Probar sin instalar nada (GitHub Codespaces)
+
+1. En GitHub abre el repositorio y cambia a la rama `claude/fortia-hours-tracking-system-xu8ddo`.
+2. Botón verde **Code › pestaña Codespaces › Create codespace on claude/fortia-hours-tracking-system-xu8ddo**.
+3. Espera 2–3 minutos: instala, carga los datos demo y arranca solo. Se abre una pestaña con una
+   URL tipo `https://<nombre>-3000.app.github.dev`. Si no se abre, ve a la pestaña **Ports** y abre el puerto 3000.
+4. Entra con los usuarios demo (contraseña `Fortia2026!`).
+
+La URL es privada (solo tu cuenta de GitHub) salvo que cambies la visibilidad del puerto a *Public*.
+El codespace se apaga solo tras 30 min sin uso; los datos demo se regeneran al crearlo.
+
 ## Arranque rápido
 
 Requiere Node.js 22.13 o superior (usa el SQLite integrado de Node; no hay dependencias nativas).
