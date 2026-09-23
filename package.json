@@ -1,0 +1,20 @@
+{
+  "name": "timesheet-fortia",
+  "version": "0.1.0",
+  "description": "Sistema de registro de horas (timesheet semanal) e indicadores de cargabilidad para consultores de Fortia, con importación de planes de Microsoft Project.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js",
+    "seed": "node --disable-warning=ExperimentalWarning scripts/seed.js",
+    "test": "node --disable-warning=ExperimentalWarning --test \"test/**/*.test.js\""
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "fast-xml-parser": "^5.11.1"
+  }
+}

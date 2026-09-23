@@ -1,0 +1,348 @@
+import express from 'express';
+import { fileURLToPath } from 'node:url';
+import { CATEGORIES, CATEGORY_KEYS, ROLES, tx } from './db.js';
+import {
+  COOKIE, authenticate, canReview, createSession, destroySession, hashPassword, requireRole,
+  sessionToken, verifyPassword, visibleUserIds,
+} from './auth.js';
+import { addDays, isIsoDate, today, weekStart } from './dates.js';
+import { parseMspdi } from './importers/mspdi.js';
+import { parseTaskCsv } from './importers/csv.js';
+import { applyPlan, plansFromCsv } from './services/plans.js';
+import { ValidationError, loadWeek, normalizeWeek, reviewTimesheet, saveWeek, submitWeek } from './services/timesheets.js';
+import { computeMetrics, entriesToCsv, entryRows } from './services/metrics.js';
+
+const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
+
+const wrap = (fn) => (req, res, next) => {
+  try {
+    const out = fn(req, res);
+    if (out !== undefined && !res.headersSent) res.json(out);
+  } catch (err) {
+    next(err);
+  }
+};
+
+const publicUser = (u) => u && {
+  id: u.id, name: u.name, email: u.email, role: u.role, weeklyCapacity: u.weekly_capacity,
+  area: u.area, managerId: u.manager_id, active: u.active === undefined ? true : !!u.active,
+  tracksTime: u.tracks_time === undefined ? true : !!u.tracks_time,
+};
+
+export function createApp(db, { secureCookies = process.env.NODE_ENV === 'production' } = {}) {
+  const app = express();
+  app.disable('x-powered-by');
+  app.use(express.json({ limit: '25mb' }));
+  app.use((req, res, next) => {
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('X-Frame-Options', 'DENY');
+    res.set('Referrer-Policy', 'same-origin');
+    next();
+  });
+  // Protección CSRF: toda escritura a la API debe venir con JSON desde la propia app.
+  app.use('/api', (req, res, next) => {
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !req.is('application/json')) {
+      return res.status(415).json({ error: 'Se esperaba application/json' });
+    }
+    next();
+  });
+
+  // ---------- Autenticación ----------
+  app.post('/api/auth/login', wrap((req, res) => {
+    const { email, password } = req.body || {};
+    const user = db.prepare('SELECT * FROM users WHERE email = ? AND active = 1').get(String(email || '').trim());
+    if (!user || !verifyPassword(String(password || ''), user.password_hash)) {
+      res.status(401);
+      return { error: 'Correo o contraseña incorrectos' };
+    }
+    const { token, maxAge } = createSession(db, user.id);
+    res.cookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', secure: secureCookies, maxAge, path: '/' });
+    return { user: publicUser(user) };
+  }));
+
+  app.post('/api/auth/logout', wrap((req, res) => {
+    const token = sessionToken(req);
+    if (token) destroySession(db, token);
+    res.clearCookie(COOKIE, { path: '/' });
+    return { ok: true };
+  }));
+
+  const auth = authenticate(db);
+  app.use('/api', (req, res, next) => (req.path.startsWith('/auth/') ? next() : auth(req, res, next)));
+
+  app.get('/api/me', wrap((req) => ({
+    user: publicUser(req.user),
+    categories: CATEGORIES,
+    today: today(),
+  })));
+
+  app.put('/api/me/password', wrap((req) => {
+    const { current, next: newPassword } = req.body || {};
+    const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
+    if (!verifyPassword(String(current || ''), row.password_hash)) throw new ValidationError('La contraseña actual no coincide');
+    if (String(newPassword || '').length < 8) throw new ValidationError('La nueva contraseña debe tener al menos 8 caracteres');
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(newPassword), req.user.id);
+    return { ok: true };
+  }));
+
+  // ---------- Timesheet propio ----------
+  app.get('/api/timesheets/:week', wrap((req) => loadWeek(db, req.user.id, normalizeWeek(req.params.week))));
+
+  app.put('/api/timesheets/:week', wrap((req) => {
+    const week = normalizeWeek(req.params.week);
+    saveWeek(db, req.user.id, week, req.body?.rows);
+    return loadWeek(db, req.user.id, week);
+  }));
+
+  app.post('/api/timesheets/:week/submit', wrap((req) => {
+    const week = normalizeWeek(req.params.week);
+    if (Array.isArray(req.body?.rows)) saveWeek(db, req.user.id, week, req.body.rows);
+    submitWeek(db, req.user.id, week);
+    return loadWeek(db, req.user.id, week);
+  }));
+
+  // ---------- Aprobaciones ----------
+  app.get('/api/approvals', requireRole('lider', 'admin'), wrap((req) => {
+    const ids = visibleUserIds(db, req.user).filter((id) => req.user.role === 'admin' || id !== req.user.id);
+    if (!ids.length) return { items: [] };
+    const status = ['enviado', 'aprobado', 'rechazado', 'borrador'].includes(req.query.status) ? req.query.status : 'enviado';
+    const items = db.prepare(`
+      SELECT ts.id, ts.week_start AS week, ts.status, ts.submitted_at AS submittedAt, ts.review_comment AS reviewComment,
+             u.id AS userId, u.name AS userName, u.weekly_capacity AS capacity,
+             COALESCE((SELECT SUM(hours) FROM time_entries e WHERE e.timesheet_id = ts.id), 0) AS hours
+      FROM timesheets ts JOIN users u ON u.id = ts.user_id
+      WHERE ts.status = ? AND u.id IN (${ids.map(() => '?').join(',')})
+      ORDER BY ts.week_start DESC, u.name LIMIT 500`).all(status, ...ids);
+    return { items };
+  }));
+
+  app.get('/api/approvals/:id', requireRole('lider', 'admin'), wrap((req) => {
+    const ts = db.prepare('SELECT * FROM timesheets WHERE id = ?').get(Number(req.params.id));
+    if (!ts || !canReview(db, req.user, ts.user_id)) throw new ValidationError('Timesheet no encontrado', 404);
+    const owner = db.prepare('SELECT * FROM users WHERE id = ?').get(ts.user_id);
+    return { user: publicUser(owner), ...loadWeek(db, ts.user_id, ts.week_start) };
+  }));
+
+  app.post('/api/approvals/:id', requireRole('lider', 'admin'), wrap((req) => {
+    const id = Number(req.params.id);
+    const ts = db.prepare('SELECT user_id FROM timesheets WHERE id = ?').get(id);
+    if (!ts || !canReview(db, req.user, ts.user_id)) throw new ValidationError('Timesheet no encontrado', 404);
+    return reviewTimesheet(db, req.user.id, id, req.body?.action, req.body?.comment);
+  }));
+
+  // ---------- Proyectos y tareas ----------
+  app.get('/api/projects', wrap(() => {
+    const items = db.prepare(`
+      SELECT p.id, p.code, p.name, p.client, p.category, p.status, p.source, p.open_to_all AS openToAll,
+             p.pm_id AS pmId, p.last_import_at AS lastImportAt,
+             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.active = 1 AND t.is_summary = 0) AS tasks,
+             (SELECT COALESCE(SUM(planned_hours), 0) FROM tasks t WHERE t.project_id = p.id AND t.active = 1 AND t.is_summary = 0) AS planned
+      FROM projects p ORDER BY p.status, p.name`).all();
+    return { items };
+  }));
+
+  const projectInput = (body) => {
+    const code = String(body.code || '').trim();
+    const name = String(body.name || '').trim();
+    if (!code || !name) throw new ValidationError('Código y nombre son obligatorios');
+    const category = CATEGORY_KEYS.includes(body.category) ? body.category : 'facturable';
+    const status = body.status === 'cerrado' ? 'cerrado' : 'activo';
+    return [code, name, body.client || null, category, status, body.openToAll ? 1 : 0, body.pmId || null];
+  };
+
+  app.post('/api/projects', requireRole('admin', 'lider'), wrap((req, res) => {
+    const args = projectInput(req.body || {});
+    try {
+      const r = db.prepare('INSERT INTO projects (code, name, client, category, status, open_to_all, pm_id) VALUES (?, ?, ?, ?, ?, ?, ?)').run(...args);
+      res.status(201);
+      return { id: Number(r.lastInsertRowid) };
+    } catch (err) {
+      if (String(err.message).includes('UNIQUE')) throw new ValidationError('Ya existe un proyecto con ese código', 409);
+      throw err;
+    }
+  }));
+
+  app.put('/api/projects/:id', requireRole('admin', 'lider'), wrap((req) => {
+    const args = projectInput(req.body || {});
+    const r = db.prepare('UPDATE projects SET code = ?, name = ?, client = ?, category = ?, status = ?, open_to_all = ?, pm_id = ? WHERE id = ?')
+      .run(...args, Number(req.params.id));
+    if (!r.changes) throw new ValidationError('Proyecto no encontrado', 404);
+    return { ok: true };
+  }));
+
+  app.get('/api/projects/:id/tasks', wrap((req) => {
+    const tasks = db.prepare(`
+      SELECT t.id, t.external_uid AS uid, t.name, t.wbs, t.outline_level AS level, t.parent_path AS parentPath,
+             t.start_date AS start, t.finish_date AS finish, t.planned_hours AS planned, t.is_summary AS isSummary,
+             t.category, t.active,
+             (SELECT COALESCE(SUM(e.hours), 0) FROM time_entries e WHERE e.task_id = t.id) AS actual,
+             (SELECT GROUP_CONCAT(u.name, ', ') FROM assignments a JOIN users u ON u.id = a.user_id WHERE a.task_id = t.id) AS resources
+      FROM tasks t WHERE t.project_id = ? ORDER BY t.active DESC, t.id`).all(Number(req.params.id));
+    return { items: tasks };
+  }));
+
+  // Alta manual de tareas (para proyectos que no vienen de Project).
+  app.post('/api/projects/:id/tasks', requireRole('admin', 'lider'), wrap((req, res) => {
+    const projectId = Number(req.params.id);
+    if (!db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) throw new ValidationError('Proyecto no encontrado', 404);
+    const b = req.body || {};
+    const name = String(b.name || '').trim();
+    if (!name) throw new ValidationError('El nombre de la tarea es obligatorio');
+    for (const d of [b.start, b.finish]) if (d && !isIsoDate(d)) throw new ValidationError('Fechas inválidas');
+    const category = CATEGORY_KEYS.includes(b.category) ? b.category : null;
+    const assignees = Array.isArray(b.userIds) ? b.userIds.map(Number) : [];
+    return tx(db, () => {
+      const r = db.prepare(`INSERT INTO tasks (project_id, external_uid, name, start_date, finish_date, planned_hours, category)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(projectId, `manual:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+        name, b.start || null, b.finish || null, Number(b.planned) || 0, category);
+      const taskId = Number(r.lastInsertRowid);
+      const per = assignees.length ? (Number(b.planned) || 0) / assignees.length : 0;
+      const ins = db.prepare('INSERT OR IGNORE INTO assignments (task_id, user_id, planned_hours) VALUES (?, ?, ?)');
+      for (const uid of assignees) ins.run(taskId, uid, per);
+      res.status(201);
+      return { id: taskId };
+    });
+  }));
+
+  // ---------- Importación desde Microsoft Project ----------
+  const logImport = (summary, source, filename, userId) =>
+    db.prepare('INSERT INTO import_log (project_id, user_id, source, filename, summary) VALUES (?, ?, ?, ?, ?)')
+      .run(summary.project?.id ?? null, userId, source, filename || null, JSON.stringify(summary));
+
+  // Con dryRun la importación corre completa dentro de una transacción que se revierte: es la vista previa exacta.
+  const runImport = (dryRun, fn) => {
+    db.exec('BEGIN');
+    try {
+      const result = fn();
+      db.exec(dryRun ? 'ROLLBACK' : 'COMMIT');
+      return { dryRun, ...result };
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  };
+
+  app.post('/api/import/msproject', requireRole('admin', 'lider'), wrap((req) => {
+    const { xml, projectId, code, client, category, filename, dryRun = false } = req.body || {};
+    if (!xml) throw new ValidationError('Adjunta el archivo XML exportado de Project');
+    let plan;
+    try { plan = parseMspdi(String(xml)); } catch (err) { throw new ValidationError(err.message); }
+    return runImport(!!dryRun, () => {
+      const summary = applyPlan(db, { ...plan, code: code || null, client, category }, { projectId: projectId ? Number(projectId) : null, source: 'msproject' });
+      if (!dryRun) logImport(summary, 'msproject', filename, req.user.id);
+      return { results: [summary] };
+    });
+  }));
+
+  app.post('/api/import/csv', requireRole('admin', 'lider'), wrap((req) => {
+    const { csv, filename, dryRun = false } = req.body || {};
+    if (!csv) throw new ValidationError('Adjunta el archivo CSV');
+    let parsed;
+    try { parsed = parseTaskCsv(String(csv)); } catch (err) { throw new ValidationError(err.message); }
+    return runImport(!!dryRun, () => {
+      const results = plansFromCsv(parsed.items).map((plan) => {
+        const summary = applyPlan(db, plan, { source: 'csv' });
+        if (!dryRun) logImport(summary, 'csv', filename, req.user.id);
+        return summary;
+      });
+      return { results, errors: parsed.errors };
+    });
+  }));
+
+  app.get('/api/import/log', requireRole('admin', 'lider'), wrap(() => ({
+    items: db.prepare(`SELECT l.id, l.source, l.filename, l.created_at AS createdAt, l.summary, u.name AS userName, p.name AS projectName
+      FROM import_log l LEFT JOIN users u ON u.id = l.user_id LEFT JOIN projects p ON p.id = l.project_id
+      ORDER BY l.id DESC LIMIT 50`).all().map((r) => ({ ...r, summary: JSON.parse(r.summary || '{}') })),
+  })));
+
+  // ---------- Usuarios ----------
+  app.get('/api/users', wrap((req) => {
+    const ids = new Set(visibleUserIds(db, req.user));
+    const all = db.prepare('SELECT * FROM users ORDER BY active DESC, name').all();
+    return { items: all.filter((u) => ids.has(u.id)).map(publicUser) };
+  }));
+
+  const userInput = (b, isNew) => {
+    const name = String(b.name || '').trim();
+    const email = String(b.email || '').trim().toLowerCase();
+    if (!name || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new ValidationError('Nombre y correo válido son obligatorios');
+    const role = ROLES.includes(b.role) ? b.role : 'consultor';
+    const cap = Number(b.weeklyCapacity ?? 40);
+    if (!Number.isFinite(cap) || cap < 0 || cap > 80) throw new ValidationError('Capacidad semanal inválida');
+    if (isNew && String(b.password || '').length < 8) throw new ValidationError('La contraseña inicial debe tener al menos 8 caracteres');
+    return { name, email, role, cap, area: b.area || null, managerId: b.managerId ? Number(b.managerId) : null, active: b.active === false ? 0 : 1, tracksTime: b.tracksTime === false ? 0 : 1 };
+  };
+
+  app.post('/api/users', requireRole('admin'), wrap((req, res) => {
+    const u = userInput(req.body || {}, true);
+    try {
+      const r = db.prepare('INSERT INTO users (name, email, password_hash, role, weekly_capacity, area, manager_id, tracks_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(u.name, u.email, hashPassword(req.body.password), u.role, u.cap, u.area, u.managerId, u.tracksTime);
+      res.status(201);
+      return { id: Number(r.lastInsertRowid) };
+    } catch (err) {
+      if (String(err.message).includes('UNIQUE')) throw new ValidationError('Ya existe un usuario con ese correo', 409);
+      throw err;
+    }
+  }));
+
+  app.put('/api/users/:id', requireRole('admin'), wrap((req) => {
+    const id = Number(req.params.id);
+    const u = userInput(req.body || {}, false);
+    if (u.managerId === id) throw new ValidationError('Un usuario no puede ser su propio líder');
+    const r = db.prepare('UPDATE users SET name = ?, email = ?, role = ?, weekly_capacity = ?, area = ?, manager_id = ?, active = ?, tracks_time = ? WHERE id = ?')
+      .run(u.name, u.email, u.role, u.cap, u.area, u.managerId, u.active, u.tracksTime, id);
+    if (!r.changes) throw new ValidationError('Usuario no encontrado', 404);
+    if (req.body.password) {
+      if (String(req.body.password).length < 8) throw new ValidationError('La contraseña debe tener al menos 8 caracteres');
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(req.body.password), id);
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+    }
+    if (!u.active) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+    return { ok: true };
+  }));
+
+  // ---------- Indicadores ----------
+  const metricsQuery = (req) => {
+    const to = isIsoDate(req.query.to) ? req.query.to : today();
+    const from = isIsoDate(req.query.from) ? req.query.from : weekStart(addDays(to, -27));
+    if (from > to) throw new ValidationError('El rango de fechas es inválido');
+    let userIds = visibleUserIds(db, req.user);
+    if (req.query.userId) {
+      const wanted = Number(req.query.userId);
+      if (!userIds.includes(wanted)) throw new ValidationError('No tienes acceso a ese consultor', 403);
+      userIds = [wanted];
+    }
+    return {
+      from, to, userIds,
+      projectId: req.query.projectId ? Number(req.query.projectId) : null,
+      includeDrafts: req.query.includeDrafts === '1' || req.query.includeDrafts === 'true',
+    };
+  };
+
+  app.get('/api/metrics', wrap((req) => computeMetrics(db, metricsQuery(req))));
+
+  app.get('/api/metrics/export.csv', (req, res, next) => {
+    try {
+      const q = metricsQuery(req);
+      res.set('Content-Type', 'text/csv; charset=utf-8');
+      res.set('Content-Disposition', `attachment; filename="horas_${q.from}_${q.to}.csv"`);
+      res.send(entriesToCsv(entryRows(db, q)));
+    } catch (err) { next(err); }
+  });
+
+  // ---------- Frontend ----------
+  app.use(express.static(PUBLIC_DIR, { index: 'index.html', maxAge: '5m' }));
+  app.use('/api', (req, res) => res.status(404).json({ error: 'Ruta no encontrada' }));
+
+  // eslint-disable-next-line no-unused-vars
+  app.use((err, req, res, next) => {
+    if (err instanceof ValidationError) return res.status(err.status).json({ error: err.message });
+    if (err.type === 'entity.too.large') return res.status(413).json({ error: 'El archivo es demasiado grande (máx. 25 MB)' });
+    if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'JSON inválido' });
+    console.error(err);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  });
+
+  return app;
+}
