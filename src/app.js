@@ -11,6 +11,8 @@ import { parseTaskCsv } from './importers/csv.js';
 import { applyPlan, plansFromCsv } from './services/plans.js';
 import { ValidationError, loadWeek, normalizeWeek, reviewTimesheet, saveWeek, submitWeek } from './services/timesheets.js';
 import { computeMetrics, entriesToCsv, entryRows } from './services/metrics.js';
+import { emailDomain, loadAuthConfig } from './config.js';
+import { LOGIN_ERRORS, createMicrosoftAuth } from './oidc.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
 
@@ -27,11 +29,15 @@ const publicUser = (u) => u && {
   id: u.id, name: u.name, email: u.email, role: u.role, weeklyCapacity: u.weekly_capacity,
   area: u.area, managerId: u.manager_id, active: u.active === undefined ? true : !!u.active,
   tracksTime: u.tracks_time === undefined ? true : !!u.tracks_time,
+  linked: !!u.external_id,
+  authProvider: u.auth_provider || 'local', lastLoginAt: u.last_login_at || null,
 };
 
-export function createApp(db, { secureCookies = process.env.NODE_ENV === 'production' } = {}) {
+export function createApp(db, { secureCookies = process.env.NODE_ENV === 'production', auth: authConfig = loadAuthConfig() } = {}) {
   const app = express();
   app.disable('x-powered-by');
+  // Detrás de un proxy/App Service con HTTPS, para que las cookies Secure funcionen.
+  if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : process.env.TRUST_PROXY);
   app.use(express.json({ limit: '25mb' }));
   app.use((req, res, next) => {
     res.set('X-Content-Type-Options', 'nosniff');
@@ -48,7 +54,25 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
   });
 
   // ---------- Autenticación ----------
+  app.get('/api/auth/config', wrap(() => ({
+    microsoft: !!authConfig.microsoft,
+    local: authConfig.localEnabled,
+    domains: authConfig.allowedDomains,
+    errors: { ...LOGIN_ERRORS, dominio: `Solo pueden entrar cuentas de ${authConfig.allowedDomains.map((d) => `@${d}`).join(', ')}.` },
+  })));
+
+  if (authConfig.microsoft) {
+    const ms = createMicrosoftAuth(db, authConfig, { secureCookies });
+    const asyncRoute = (fn) => (req, res, next) => fn(req, res).catch(next);
+    app.get('/auth/microsoft/login', asyncRoute(ms.login));
+    app.get('/auth/microsoft/callback', asyncRoute(ms.callback));
+  }
+
   app.post('/api/auth/login', wrap((req, res) => {
+    if (!authConfig.localEnabled) {
+      res.status(403);
+      return { error: 'El acceso con contraseña está deshabilitado; entra con tu cuenta de Microsoft 365' };
+    }
     const { email, password } = req.body || {};
     const user = db.prepare('SELECT * FROM users WHERE email = ? AND active = 1').get(String(email || '').trim());
     if (!user || !verifyPassword(String(password || ''), user.password_hash)) {
@@ -77,6 +101,7 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
   })));
 
   app.put('/api/me/password', wrap((req) => {
+    if (!authConfig.localEnabled) throw new ValidationError('La contraseña se administra en Microsoft 365', 403);
     const { current, next: newPassword } = req.body || {};
     const row = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
     if (!verifyPassword(String(current || ''), row.password_hash)) throw new ValidationError('La contraseña actual no coincide');
@@ -269,7 +294,12 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
     const role = ROLES.includes(b.role) ? b.role : 'consultor';
     const cap = Number(b.weeklyCapacity ?? 40);
     if (!Number.isFinite(cap) || cap < 0 || cap > 80) throw new ValidationError('Capacidad semanal inválida');
-    if (isNew && String(b.password || '').length < 8) throw new ValidationError('La contraseña inicial debe tener al menos 8 caracteres');
+    if (authConfig.microsoft && !authConfig.localEnabled && !authConfig.allowedDomains.includes(emailDomain(email))) {
+      throw new ValidationError(`El correo debe ser de ${authConfig.allowedDomains.join(', ')} para poder entrar con Microsoft 365`);
+    }
+    if (isNew && authConfig.localEnabled && String(b.password || '').length < 8) {
+      throw new ValidationError('La contraseña inicial debe tener al menos 8 caracteres');
+    }
     return { name, email, role, cap, area: b.area || null, managerId: b.managerId ? Number(b.managerId) : null, active: b.active === false ? 0 : 1, tracksTime: b.tracksTime === false ? 0 : 1 };
   };
 
@@ -277,7 +307,7 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
     const u = userInput(req.body || {}, true);
     try {
       const r = db.prepare('INSERT INTO users (name, email, password_hash, role, weekly_capacity, area, manager_id, tracks_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(u.name, u.email, hashPassword(req.body.password), u.role, u.cap, u.area, u.managerId, u.tracksTime);
+        .run(u.name, u.email, authConfig.localEnabled ? hashPassword(req.body.password) : '!', u.role, u.cap, u.area, u.managerId, u.tracksTime);
       res.status(201);
       return { id: Number(r.lastInsertRowid) };
     } catch (err) {
@@ -293,12 +323,17 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
     const r = db.prepare('UPDATE users SET name = ?, email = ?, role = ?, weekly_capacity = ?, area = ?, manager_id = ?, active = ?, tracks_time = ? WHERE id = ?')
       .run(u.name, u.email, u.role, u.cap, u.area, u.managerId, u.active, u.tracksTime, id);
     if (!r.changes) throw new ValidationError('Usuario no encontrado', 404);
-    if (req.body.password) {
+    if (req.body.password && authConfig.localEnabled) {
       if (String(req.body.password).length < 8) throw new ValidationError('La contraseña debe tener al menos 8 caracteres');
       db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(req.body.password), id);
       db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
     }
     if (!u.active) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+    // Permite que el usuario vuelva a ligarse con otra cuenta de Microsoft 365 (cuenta recreada en Entra ID).
+    if (req.body.unlinkMicrosoft) {
+      db.prepare('UPDATE users SET external_id = NULL WHERE id = ?').run(id);
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+    }
     return { ok: true };
   }));
 

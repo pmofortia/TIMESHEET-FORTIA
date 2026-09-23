@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS users (
   area            TEXT,
   manager_id      INTEGER REFERENCES users(id),
   tracks_time     INTEGER NOT NULL DEFAULT 1, -- cuenta para capacidad y cargabilidad
+  auth_provider   TEXT NOT NULL DEFAULT 'local', -- 'local' o 'microsoft'
+  external_id     TEXT UNIQUE,                   -- oid del usuario en Entra ID
+  last_login_at   TEXT,
   active          INTEGER NOT NULL DEFAULT 1,
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -33,6 +36,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   token      TEXT PRIMARY KEY,
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   expires_at TEXT NOT NULL
+);
+
+-- Solicitudes de inicio de sesión OIDC en curso (state, nonce y PKCE).
+CREATE TABLE IF NOT EXISTS oidc_requests (
+  state      TEXT PRIMARY KEY,
+  nonce      TEXT NOT NULL,
+  verifier   TEXT NOT NULL,
+  return_to  TEXT,
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -117,7 +129,19 @@ export function openDb(file = process.env.DB_FILE || 'data/timesheet.db') {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+// Columnas agregadas después de la primera versión del esquema.
+function migrate(db) {
+  const cols = new Set(db.prepare('PRAGMA table_info(users)').all().map((c) => c.name));
+  if (!cols.has('auth_provider')) db.exec("ALTER TABLE users ADD COLUMN auth_provider TEXT NOT NULL DEFAULT 'local'");
+  if (!cols.has('external_id')) {
+    db.exec('ALTER TABLE users ADD COLUMN external_id TEXT');
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_external ON users(external_id)');
+  }
+  if (!cols.has('last_login_at')) db.exec('ALTER TABLE users ADD COLUMN last_login_at TEXT');
 }
 
 // node:sqlite no trae helper de transacciones.

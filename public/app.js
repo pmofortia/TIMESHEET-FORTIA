@@ -4,7 +4,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-const state = { me: null, categories: [], today: null, dirty: false, pending: 0 };
+const state = { me: null, categories: [], today: null, dirty: false, pending: 0, auth: { microsoft: false, local: true, errors: {} } };
 
 // ---------- Utilidades ----------
 const nf = new Intl.NumberFormat('es-MX', { maximumFractionDigits: 2 });
@@ -35,7 +35,8 @@ async function api(method, path, body) {
     credentials: 'same-origin',
   });
   const data = res.headers.get('content-type')?.includes('json') ? await res.json() : null;
-  if (res.status === 401 && path !== '/auth/login') {
+  // Sesión vencida a media operación: regresar al login (en el arranque lo resuelve boot()).
+  if (res.status === 401 && state.me && path !== '/auth/login') {
     state.me = null;
     renderLogin();
     throw new Error('Tu sesión expiró');
@@ -71,6 +72,9 @@ document.addEventListener('pointermove', (e) => {
 // ---------- Arranque ----------
 async function boot() {
   try {
+    state.auth = await api('GET', '/auth/config');
+  } catch { /* se usa la configuración por defecto */ }
+  try {
     const data = await api('GET', '/me');
     Object.assign(state, { me: data.user, categories: data.categories, today: data.today });
     renderShell();
@@ -80,19 +84,35 @@ async function boot() {
   }
 }
 
+const MS_LOGO = '<svg width="18" height="18" viewBox="0 0 21 21" aria-hidden="true"><rect width="10" height="10" fill="#f25022"/><rect x="11" width="10" height="10" fill="#7fba00"/><rect y="11" width="10" height="10" fill="#00a4ef"/><rect x="11" y="11" width="10" height="10" fill="#ffb900"/></svg>';
+
+// El callback de Microsoft regresa con ?login_error=<código>; se lee una vez y se limpia la URL.
+let initialLoginError = new URLSearchParams(location.search).get('login_error');
+if (initialLoginError) history.replaceState(null, '', location.pathname + location.hash);
+
 function renderLogin() {
+  const code = initialLoginError;
+  initialLoginError = null; // solo se muestra una vez
+  const message = code ? state.auth.errors?.[code] || 'No se pudo iniciar sesión.' : '';
+  const next = encodeURIComponent(`/${location.hash || ''}`);
+  const { microsoft, local } = state.auth;
   $('#app').innerHTML = `
     <div class="login"><div class="card">
       <h1>Timesheet Fortia</h1>
       <p class="muted">Registro semanal de horas por proyecto</p>
+      ${message ? `<div class="notice" role="alert" style="margin-top:14px">${esc(message)}</div>` : ''}
+      ${microsoft ? `<a class="btn ms-btn" href="/auth/microsoft/login?next=${next}">${MS_LOGO}Iniciar sesión con Microsoft 365</a>
+        <p class="small muted" style="margin-top:8px">Usa tu cuenta ${esc((state.auth.domains || []).map((d) => `@${d}`).join(', '))}</p>` : ''}
+      ${local ? `
+      ${microsoft ? '<p class="small muted divider">o con contraseña local</p>' : ''}
       <form id="login-form">
-        <label class="field">Correo<input name="email" type="email" autocomplete="username" required autofocus></label>
+        <label class="field">Correo<input name="email" type="email" autocomplete="username" required ${microsoft ? '' : 'autofocus'}></label>
         <label class="field">Contraseña<input name="password" type="password" autocomplete="current-password" required></label>
-        <button class="primary" type="submit">Entrar</button>
+        <button class="${microsoft ? '' : 'primary'}" type="submit">Entrar</button>
         <p class="small muted" id="login-error" role="alert"></p>
-      </form>
+      </form>` : ''}
     </div></div>`;
-  $('#login-form').addEventListener('submit', async (e) => {
+  $('#login-form')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
     try {
@@ -125,12 +145,12 @@ function renderShell() {
             .map((n) => `<a href="${n.href}" data-match="${n.match}">${n.label}${n.badge ? '<span class="badge-count hidden" id="pending-badge"></span>' : ''}</a>`).join('')}
         </nav>
         <div class="me"><b>${esc(state.me.name)}</b><span>${roleLabel}</span>
-          <div class="row"><button id="btn-password" type="button">Contraseña</button><button id="btn-logout" type="button">Salir</button></div></div>
+          <div class="row">${state.auth.local && state.me.authProvider !== 'microsoft' ? '<button id="btn-password" type="button">Contraseña</button>' : ''}<button id="btn-logout" type="button">Salir</button></div></div>
       </aside>
       <main class="main" id="main"></main>
     </div>`;
   $('#btn-logout').onclick = async () => { await api('POST', '/auth/logout').catch(() => {}); state.me = null; location.hash = ''; renderLogin(); };
-  $('#btn-password').onclick = openPasswordDialog;
+  if ($('#btn-password')) $('#btn-password').onclick = openPasswordDialog;
   refreshPending();
 }
 
@@ -747,12 +767,13 @@ async function viewUsers() {
   const { items } = await api('GET', '/users');
   const byId = new Map(items.map((u) => [u.id, u]));
   $('#main').innerHTML = `
-    <div class="page-head"><div><h1>Usuarios</h1><div class="sub">El correo debe coincidir con el del recurso en Project para vincular asignaciones.</div></div>
+    <div class="page-head"><div><h1>Usuarios</h1><div class="sub">El correo debe coincidir con el del recurso en Project para vincular asignaciones${state.auth.microsoft ? ' y con la cuenta de Microsoft 365 para entrar' : ''}.</div></div>
       <button class="primary" id="new-user">Nuevo usuario</button></div>
     <div class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th>Área</th><th>Líder</th><th class="num">Capacidad</th><th>Cargabilidad</th><th>Estatus</th><th></th></tr></thead>
+      <thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th>Área</th><th>Líder</th><th class="num">Capacidad</th><th>Cargabilidad</th><th>Acceso</th><th>Estatus</th><th></th></tr></thead>
       <tbody>${items.map((u) => `<tr style="${u.active ? '' : 'opacity:.55'}"><td>${esc(u.name)}</td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${esc(u.area || '')}</td>
         <td>${esc(byId.get(u.managerId)?.name || '')}</td><td class="num">${fmtH(u.weeklyCapacity)}</td><td>${u.tracksTime ? 'Cuenta' : 'No cuenta'}</td>
+        <td class="small">${u.authProvider === 'microsoft' ? 'Microsoft 365' : 'Contraseña'}<div class="muted">${u.lastLoginAt ? `Último: ${esc(u.lastLoginAt.slice(0, 10))}` : 'Nunca ha entrado'}</div></td>
         <td>${u.active ? 'Activo' : 'Inactivo'}</td><td><button class="ghost" data-edit="${u.id}">Editar</button></td></tr>`).join('')}</tbody>
     </table></div></div>`;
   $('#new-user').onclick = () => userDialog({}, items);
@@ -770,10 +791,11 @@ function userDialog(u, all) {
       <label class="field">Área<input name="area" value="${esc(u.area || '')}"></label>
       <label class="field">Líder (aprueba sus horas)<select name="managerId"><option value="">—</option>${leaders.map((l) => `<option value="${l.id}" ${l.id === u.managerId ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
       <label class="field">Capacidad semanal (h)<input name="weeklyCapacity" type="number" min="0" max="80" step="0.5" value="${u.weeklyCapacity ?? 40}"></label>
-      <label class="field">${u.id ? 'Nueva contraseña (opcional)' : 'Contraseña inicial'}<input name="password" type="password" minlength="8" ${u.id ? '' : 'required'} autocomplete="new-password"></label>
+      ${state.auth.local ? `<label class="field">${u.id ? 'Nueva contraseña (opcional)' : 'Contraseña inicial'}<input name="password" type="password" minlength="8" ${u.id ? '' : 'required'} autocomplete="new-password"></label>` : ''}
     </div>
     <p><label class="check"><input type="checkbox" name="tracksTime" ${u.tracksTime !== false ? 'checked' : ''}> Cuenta para capacidad y cargabilidad</label>
-      <label class="check" style="margin-left:14px"><input type="checkbox" name="active" ${u.active !== false ? 'checked' : ''}> Activo</label></p>
+      <label class="check" style="margin-left:14px"><input type="checkbox" name="active" ${u.active !== false ? 'checked' : ''}> Activo</label>
+      ${u.linked ? '<br><label class="check" style="margin-top:8px"><input type="checkbox" name="unlinkMicrosoft"> Desvincular cuenta de Microsoft 365 (si la cuenta se recreó en Entra ID)</label>' : ''}</p>
     <div class="row"><span class="spacer"></span><button value="cancel" formnovalidate>Cancelar</button><button class="primary" value="ok">Guardar</button></div></form>`;
   document.body.append(dlg);
   dlg.showModal();
@@ -783,6 +805,7 @@ function userDialog(u, all) {
       const body = Object.fromEntries(f.entries());
       body.tracksTime = f.has('tracksTime');
       body.active = f.has('active');
+      body.unlinkMicrosoft = f.has('unlinkMicrosoft');
       body.weeklyCapacity = Number(body.weeklyCapacity);
       body.managerId = body.managerId ? Number(body.managerId) : null;
       if (!body.password) delete body.password;

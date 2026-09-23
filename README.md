@@ -19,7 +19,18 @@ Usuarios del demo (contraseña `Fortia2026!`): `admin@fortia.com.mx`, `laura.mar
 (líder), `ana.lopez@fortia.com.mx`, `carlos.ramirez@fortia.com.mx`, `maria.hernandez@fortia.com.mx`.
 
 Sin `seed`, el primer arranque crea un administrador y muestra la contraseña en consola
-(o usa `ADMIN_EMAIL` / `ADMIN_PASSWORD`).
+(o usa `ADMIN_EMAIL` / `ADMIN_PASSWORD`). Las variables se pueden poner en un archivo `.env`
+(ver `.env.example`).
+
+## Acceso con Microsoft 365
+
+En producción se entra **solo con la cuenta de Microsoft 365 de Fortia** (`@fortia.com.mx`).
+La app valida que el token venga del tenant de Fortia y que el correo sea del dominio permitido;
+la contraseña local se apaga sola al configurar Microsoft. El primer acceso de un consultor lo da
+de alta como *consultor* (configurable). Pasos para registrar la app en Entra ID, variables y reglas
+de vinculación de cuentas: **[docs/microsoft-365.md](docs/microsoft-365.md)**.
+
+Sin las variables `ENTRA_*`, el sistema funciona con usuario y contraseña locales (útil para el demo).
 
 | Variable | Default | Uso |
 |---|---|---|
@@ -28,6 +39,11 @@ Sin `seed`, el primer arranque crea un administrador y muestra la contraseña en
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | — | Administrador inicial |
 | `TARGET_UTILIZATION` | `0.75` | Meta de cargabilidad mostrada en los indicadores |
 | `NODE_ENV=production` | — | Cookies de sesión `Secure` (requiere HTTPS) |
+| `APP_BASE_URL`, `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET` | — | Activan el acceso con Microsoft 365 |
+| `AUTH_ALLOWED_DOMAINS` | `fortia.com.mx` | Dominios de correo que pueden entrar |
+| `AUTH_AUTO_PROVISION` | `true` | Alta automática como consultor en el primer acceso |
+| `AUTH_LOCAL_ENABLED` | `false` con Microsoft, `true` sin él | Permite usuario/contraseña local |
+| `TRUST_PROXY` | — | `true` si hay un proxy HTTPS delante (App Service, nginx) |
 
 ## Cómo funciona
 
@@ -65,7 +81,8 @@ Todo el detalle se exporta a CSV (compatible con Excel/Power BI).
 
 ## Integración con Project: lo que hay y lo que falta
 
-Hoy la integración es **por archivo** (XML de Project o CSV). Una sincronización automática depende
+Hoy la integración es **por archivo** (XML de Project o CSV). La siguiente fase es conectarse a
+**Project para la web / Planner Premium** vía Dataverse. Una sincronización automática depende
 de qué producto usa Fortia, porque cada uno tiene una API distinta:
 
 | Producto | Vía de integración automática |
@@ -85,6 +102,8 @@ src/
   app.js               API REST (Express) y archivos estáticos
   db.js                esquema SQLite y rubros
   auth.js              contraseñas scrypt, sesiones, permisos por rol
+  oidc.js              inicio de sesión con Microsoft 365 (OIDC + PKCE)
+  config.js            configuración de acceso desde variables de entorno
   importers/mspdi.js   lector del XML de Microsoft Project
   importers/csv.js     lector CSV (coma o punto y coma, fechas dd/mm/aaaa)
   services/plans.js    aplica un plan importado (idempotente)
@@ -97,8 +116,8 @@ test/                  pruebas (node --test)
 
 ## Pendientes recomendados antes de producción
 
-- **Inicio de sesión con Microsoft 365 (Entra ID)** en lugar de contraseñas locales.
 - **Calendario de días festivos** para que la capacidad no los cuente como hábiles.
-- **Conector automático** a Project Online o Dataverse (ver tabla de integración).
+- **Conector a Planner Premium** (Dataverse) para dejar de subir el XML a mano.
+- **Acceso de externos** como invitados B2B con un rol limitado (ver docs/microsoft-365.md).
 - Recordatorio por correo o Teams cuando la semana no se envía.
 - Respaldo del archivo SQLite, o migrar a PostgreSQL / Azure SQL si hay muchos usuarios concurrentes.

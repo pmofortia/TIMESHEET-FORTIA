@@ -13,7 +13,7 @@ export const INTERNAL_ACTIVITIES = [
   ['INT-FESTIVO', 'Día festivo', 'ausencia'],
 ];
 
-export function ensureBaseData(db, { log = console.log } = {}) {
+export function ensureBaseData(db, { log = console.log, auth = { microsoft: null, localEnabled: true } } = {}) {
   let project = db.prepare("SELECT id FROM projects WHERE code = 'FORTIA-INT'").get();
   if (!project) {
     const r = db.prepare(`INSERT INTO projects (code, name, client, category, open_to_all, source)
@@ -24,7 +24,18 @@ export function ensureBaseData(db, { log = console.log } = {}) {
   for (const [uid, name, category] of INTERNAL_ACTIVITIES) ins.run(project.id, uid, name, category);
 
   const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").get().n;
-  if (!admins) {
+  if (!admins && !auth.localEnabled) {
+    // Solo Microsoft 365: el admin inicial se liga a su cuenta en su primer inicio de sesión.
+    const email = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+    if (!email) throw new Error('Define ADMIN_EMAIL con el correo @fortia.com.mx de quien administrará el sistema');
+    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    if (existing) db.prepare("UPDATE users SET role = 'admin' WHERE id = ?").run(existing.id);
+    else {
+      db.prepare(`INSERT INTO users (name, email, password_hash, role, tracks_time, auth_provider) VALUES (?, ?, '!', 'admin', 0, 'microsoft')`)
+        .run(email.split('@')[0], email);
+    }
+    log(`Administrador inicial: ${email} (entra con Microsoft 365)`);
+  } else if (!admins) {
     const email = process.env.ADMIN_EMAIL || 'admin@fortia.com.mx';
     const password = process.env.ADMIN_PASSWORD || randomBytes(9).toString('base64url');
     db.prepare(`INSERT INTO users (name, email, password_hash, role, tracks_time) VALUES ('Administrador', ?, ?, 'admin', 0)`)

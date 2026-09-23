@@ -43,7 +43,7 @@ export function sessionToken(req) {
 
 export function authenticate(db) {
   const stmt = db.prepare(`
-    SELECT u.id, u.name, u.email, u.role, u.weekly_capacity, u.area, u.manager_id
+    SELECT u.id, u.name, u.email, u.role, u.weekly_capacity, u.area, u.manager_id, u.auth_provider
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token = ? AND s.expires_at > ? AND u.active = 1`);
   return (req, res, next) => {
