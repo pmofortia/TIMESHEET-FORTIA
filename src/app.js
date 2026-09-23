@@ -1,6 +1,6 @@
 import express from 'express';
 import { fileURLToPath } from 'node:url';
-import { CATEGORIES, CATEGORY_KEYS, ROLES, tx } from './db.js';
+import { CLOSED_STATUSES, PROJECT_STAGES, PROJECT_STATUSES, ROLES, ROLE_LABELS, weeklyHoursSetting } from './db.js';
 import {
   COOKIE, authenticate, canReview, createSession, destroySession, hashPassword, requireRole,
   sessionToken, verifyPassword, visibleUserIds,
@@ -16,14 +16,10 @@ import { LOGIN_ERRORS, createMicrosoftAuth } from './oidc.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
 
-const wrap = (fn) => (req, res, next) => {
-  try {
-    const out = fn(req, res);
-    if (out !== undefined && !res.headersSent) res.json(out);
-  } catch (err) {
-    next(err);
-  }
-};
+import { wrap } from './http.js';
+import { registerAdminRoutes } from './routes/admin.js';
+import { registerProjectRoutes } from './routes/projects.js';
+import { canManageProject } from './services/access.js';
 
 const publicUser = (u) => u && {
   id: u.id, name: u.name, email: u.email, role: u.role, weeklyCapacity: u.weekly_capacity,
@@ -96,8 +92,12 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
 
   app.get('/api/me', wrap((req) => ({
     user: publicUser(req.user),
-    categories: CATEGORIES,
     today: today(),
+    roleLabels: ROLE_LABELS,
+    statuses: PROJECT_STATUSES,
+    closedStatuses: CLOSED_STATUSES,
+    stages: PROJECT_STAGES,
+    weeklyHours: weeklyHoursSetting(db),
   })));
 
   app.put('/api/me/password', wrap((req) => {
@@ -155,79 +155,9 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
     return reviewTimesheet(db, req.user.id, id, req.body?.action, req.body?.comment);
   }));
 
-  // ---------- Proyectos y tareas ----------
-  app.get('/api/projects', wrap(() => {
-    const items = db.prepare(`
-      SELECT p.id, p.code, p.name, p.client, p.category, p.status, p.source, p.open_to_all AS openToAll,
-             p.pm_id AS pmId, p.last_import_at AS lastImportAt,
-             (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.active = 1 AND t.is_summary = 0) AS tasks,
-             (SELECT COALESCE(SUM(planned_hours), 0) FROM tasks t WHERE t.project_id = p.id AND t.active = 1 AND t.is_summary = 0) AS planned
-      FROM projects p ORDER BY p.status, p.name`).all();
-    return { items };
-  }));
-
-  const projectInput = (body) => {
-    const code = String(body.code || '').trim();
-    const name = String(body.name || '').trim();
-    if (!code || !name) throw new ValidationError('Código y nombre son obligatorios');
-    const category = CATEGORY_KEYS.includes(body.category) ? body.category : 'facturable';
-    const status = body.status === 'cerrado' ? 'cerrado' : 'activo';
-    return [code, name, body.client || null, category, status, body.openToAll ? 1 : 0, body.pmId || null];
-  };
-
-  app.post('/api/projects', requireRole('admin', 'lider'), wrap((req, res) => {
-    const args = projectInput(req.body || {});
-    try {
-      const r = db.prepare('INSERT INTO projects (code, name, client, category, status, open_to_all, pm_id) VALUES (?, ?, ?, ?, ?, ?, ?)').run(...args);
-      res.status(201);
-      return { id: Number(r.lastInsertRowid) };
-    } catch (err) {
-      if (String(err.message).includes('UNIQUE')) throw new ValidationError('Ya existe un proyecto con ese código', 409);
-      throw err;
-    }
-  }));
-
-  app.put('/api/projects/:id', requireRole('admin', 'lider'), wrap((req) => {
-    const args = projectInput(req.body || {});
-    const r = db.prepare('UPDATE projects SET code = ?, name = ?, client = ?, category = ?, status = ?, open_to_all = ?, pm_id = ? WHERE id = ?')
-      .run(...args, Number(req.params.id));
-    if (!r.changes) throw new ValidationError('Proyecto no encontrado', 404);
-    return { ok: true };
-  }));
-
-  app.get('/api/projects/:id/tasks', wrap((req) => {
-    const tasks = db.prepare(`
-      SELECT t.id, t.external_uid AS uid, t.name, t.wbs, t.outline_level AS level, t.parent_path AS parentPath,
-             t.start_date AS start, t.finish_date AS finish, t.planned_hours AS planned, t.is_summary AS isSummary,
-             t.category, t.active,
-             (SELECT COALESCE(SUM(e.hours), 0) FROM time_entries e WHERE e.task_id = t.id) AS actual,
-             (SELECT GROUP_CONCAT(u.name, ', ') FROM assignments a JOIN users u ON u.id = a.user_id WHERE a.task_id = t.id) AS resources
-      FROM tasks t WHERE t.project_id = ? ORDER BY t.active DESC, t.id`).all(Number(req.params.id));
-    return { items: tasks };
-  }));
-
-  // Alta manual de tareas (para proyectos que no vienen de Project).
-  app.post('/api/projects/:id/tasks', requireRole('admin', 'lider'), wrap((req, res) => {
-    const projectId = Number(req.params.id);
-    if (!db.prepare('SELECT 1 FROM projects WHERE id = ?').get(projectId)) throw new ValidationError('Proyecto no encontrado', 404);
-    const b = req.body || {};
-    const name = String(b.name || '').trim();
-    if (!name) throw new ValidationError('El nombre de la tarea es obligatorio');
-    for (const d of [b.start, b.finish]) if (d && !isIsoDate(d)) throw new ValidationError('Fechas inválidas');
-    const category = CATEGORY_KEYS.includes(b.category) ? b.category : null;
-    const assignees = Array.isArray(b.userIds) ? b.userIds.map(Number) : [];
-    return tx(db, () => {
-      const r = db.prepare(`INSERT INTO tasks (project_id, external_uid, name, start_date, finish_date, planned_hours, category)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(projectId, `manual:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
-        name, b.start || null, b.finish || null, Number(b.planned) || 0, category);
-      const taskId = Number(r.lastInsertRowid);
-      const per = assignees.length ? (Number(b.planned) || 0) / assignees.length : 0;
-      const ins = db.prepare('INSERT OR IGNORE INTO assignments (task_id, user_id, planned_hours) VALUES (?, ?, ?)');
-      for (const uid of assignees) ins.run(taskId, uid, per);
-      res.status(201);
-      return { id: taskId };
-    });
-  }));
+  // ---------- Proyectos, catálogos y administración ----------
+  registerProjectRoutes(app, db);
+  registerAdminRoutes(app, db);
 
   // ---------- Importación desde Microsoft Project ----------
   const logImport = (summary, source, filename, userId) =>
@@ -247,13 +177,26 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
     }
   };
 
+  // Un gestor solo puede importar sobre proyectos que gestiona; si el plan crea un proyecto nuevo, queda como su gestor.
+  const guardImport = (req, summary) => {
+    if (summary.created) {
+      if (req.user.role === 'lider') db.prepare('UPDATE projects SET pm_id = ? WHERE id = ?').run(req.user.id, summary.project.id);
+    } else if (!canManageProject(db, req.user, summary.project.id)) {
+      throw new ValidationError(`El proyecto "${summary.project.name}" ya existe y no eres su gestor`, 403);
+    }
+  };
+
   app.post('/api/import/msproject', requireRole('admin', 'lider'), wrap((req) => {
-    const { xml, projectId, code, client, category, filename, dryRun = false } = req.body || {};
+    const { xml, projectId, code, clientId, filename, dryRun = false } = req.body || {};
     if (!xml) throw new ValidationError('Adjunta el archivo XML exportado de Project');
     let plan;
     try { plan = parseMspdi(String(xml)); } catch (err) { throw new ValidationError(err.message); }
     return runImport(!!dryRun, () => {
-      const summary = applyPlan(db, { ...plan, code: code || null, client, category }, { projectId: projectId ? Number(projectId) : null, source: 'msproject' });
+      let summary;
+      try {
+        summary = applyPlan(db, { ...plan, code: code || null, clientId: clientId || null }, { projectId: projectId ? Number(projectId) : null, source: 'msproject' });
+      } catch (err) { throw err instanceof ValidationError ? err : new ValidationError(err.message); }
+      guardImport(req, summary);
       if (!dryRun) logImport(summary, 'msproject', filename, req.user.id);
       return { results: [summary] };
     });
@@ -267,6 +210,7 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
     return runImport(!!dryRun, () => {
       const results = plansFromCsv(parsed.items).map((plan) => {
         const summary = applyPlan(db, plan, { source: 'csv' });
+        guardImport(req, summary);
         if (!dryRun) logImport(summary, 'csv', filename, req.user.id);
         return summary;
       });
@@ -292,7 +236,7 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
     const email = String(b.email || '').trim().toLowerCase();
     if (!name || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new ValidationError('Nombre y correo válido son obligatorios');
     const role = ROLES.includes(b.role) ? b.role : 'consultor';
-    const cap = Number(b.weeklyCapacity ?? 40);
+    const cap = Number(b.weeklyCapacity ?? weeklyHoursSetting(db));
     if (!Number.isFinite(cap) || cap < 0 || cap > 80) throw new ValidationError('Capacidad semanal inválida');
     if (authConfig.microsoft && !authConfig.localEnabled && !authConfig.allowedDomains.includes(emailDomain(email))) {
       throw new ValidationError(`El correo debe ser de ${authConfig.allowedDomains.join(', ')} para poder entrar con Microsoft 365`);
@@ -351,6 +295,7 @@ export function createApp(db, { secureCookies = process.env.NODE_ENV === 'produc
     return {
       from, to, userIds,
       projectId: req.query.projectId ? Number(req.query.projectId) : null,
+      clientId: req.query.clientId ? Number(req.query.clientId) : null,
       includeDrafts: req.query.includeDrafts === '1' || req.query.includeDrafts === 'true',
     };
   };

@@ -20,12 +20,9 @@
   --critical: #d03b3b;
   --critical-text: #b42a2a;
   --weekend: #f4f3ef;
-  --cat-facturable: #2a78d6;
-  --cat-preventa: #eb6834;
-  --cat-interno: #1baf7a;
-  --cat-capacitacion: #eda100;
-  --cat-administrativo: #e87ba4;
-  --cat-ausencia: #008300;
+  --kind-project: #2a78d6;
+  --kind-deduct: #eb6834;
+  --kind-admin: #1baf7a;
   --radius: 10px;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
@@ -48,12 +45,12 @@
     --good-text: #0ca30c;
     --critical-text: #e66767;
     --weekend: #1f1f1d;
-    --cat-facturable: #3987e5;
-    --cat-preventa: #d95926;
-    --cat-interno: #199e70;
-    --cat-capacitacion: #c98500;
-    --cat-administrativo: #d55181;
-    --cat-ausencia: #008300;
+    --kind-project: #3987e5;
+    --kind-deduct: #d95926;
+    --kind-admin: #199e70;
+    --kind-project: #3987e5;
+  --kind-deduct: #d95926;
+  --kind-admin: #199e70;
   }
 }
 :root[data-theme="dark"] {
@@ -73,12 +70,6 @@
   --good-text: #0ca30c;
   --critical-text: #e66767;
   --weekend: #1f1f1d;
-  --cat-facturable: #3987e5;
-  --cat-preventa: #d95926;
-  --cat-interno: #199e70;
-  --cat-capacitacion: #c98500;
-  --cat-administrativo: #d55181;
-  --cat-ausencia: #008300;
 }
 
 * { box-sizing: border-box; }
@@ -152,7 +143,9 @@ tfoot td { font-weight: 700; border-top: 2px solid var(--border-strong); border-
 /* ---------- Timesheet ---------- */
 .ts-table th.day, .ts-table td.day { width: 72px; text-align: center; }
 .ts-table th.day .date { display: block; font-weight: 400; color: var(--muted); font-size: 11px; }
-.ts-table .weekend { background: var(--weekend); }
+.ts-table .holiday { background: var(--weekend); }
+.ts-table th .hol { color: var(--critical-text); font-weight: 600; }
+.ok { color: var(--good-text); font-weight: 700; }
 .ts-table input.h { width: 60px; text-align: center; padding: 6px 4px; font-variant-numeric: tabular-nums; }
 .ts-table input.h:disabled { background: transparent; border-color: transparent; color: var(--text); opacity: 1; }
 .ts-table td.task { min-width: 260px; }
@@ -244,3 +237,15 @@ pre.code { background: var(--surface-2); padding: 10px; border-radius: 8px; over
   .sidebar, .filters, button { display: none !important; }
   .shell { display: block; }
 }
+
+/* ---------- Proyectos y administración ---------- */
+.facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px 18px; }
+.chip { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 99px; background: var(--surface-2); border: 1px solid var(--border); margin: 2px 2px 2px 0; }
+.member-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px 14px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+.tabs a { padding: 8px 12px; text-decoration: none; color: var(--text-2); border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tabs a.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+dialog.wide { max-width: 760px; }
+fieldset.modules { border: 1px solid var(--border); border-radius: 8px; margin: 14px 0; padding: 10px 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px 12px; }
+fieldset.modules legend { font-size: 12px; color: var(--text-2); padding: 0 4px; }
+td input:not([type=checkbox]) { width: 100%; }

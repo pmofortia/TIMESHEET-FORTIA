@@ -1,4 +1,4 @@
-import { tx } from '../db.js';
+import { CLOSED_STATUSES, tx } from '../db.js';
 import { addDays, isIsoDate, weekDays, weekStart } from '../dates.js';
 
 export class ValidationError extends Error {
@@ -12,26 +12,30 @@ const EDITABLE = new Set(['borrador', 'rechazado']);
 
 const TASK_COLUMNS = `
   t.id AS taskId, t.name AS taskName, t.parent_path AS parentPath, t.wbs, t.start_date AS start, t.finish_date AS finish,
-  p.id AS projectId, p.code AS projectCode, p.name AS projectName, p.client,
-  COALESCE(t.category, p.category) AS category`;
+  p.id AS projectId, p.code AS projectCode, p.name AS projectName, c.name AS client,
+  p.is_internal AS isAdmin, t.reduces_availability AS reducesAvailability, m.code AS moduleCode`;
+const TASK_FROM = `tasks t JOIN projects p ON p.id = t.project_id
+  LEFT JOIN clients c ON c.id = p.client_id LEFT JOIN modules m ON m.id = t.module_id`;
+const CLOSED_SQL = CLOSED_STATUSES.map((s) => `'${s}'`).join(',');
 
 function getTimesheet(db, userId, week) {
   return db.prepare('SELECT * FROM timesheets WHERE user_id = ? AND week_start = ?').get(userId, week);
 }
 
-// Tareas en las que el usuario puede registrar horas: las que tiene asignadas
-// en Project y las actividades abiertas a todos (internas, capacitación...).
+// Tareas en las que el usuario puede registrar horas: las de proyectos a los que tiene acceso
+// (miembro o gestor) que no estén entregados o suspendidos, más las tareas administrativas activas.
 function allowedTasks(db, userId) {
   return db.prepare(`
-    SELECT ${TASK_COLUMNS}, a.planned_hours AS plannedHours, 1 AS assigned
-    FROM assignments a JOIN tasks t ON t.id = a.task_id JOIN projects p ON p.id = t.project_id
-    WHERE a.user_id = ? AND t.active = 1 AND t.is_summary = 0 AND p.status = 'activo'
-    UNION ALL
-    SELECT ${TASK_COLUMNS}, NULL AS plannedHours, 0 AS assigned
-    FROM tasks t JOIN projects p ON p.id = t.project_id
-    WHERE p.open_to_all = 1 AND t.active = 1 AND t.is_summary = 0 AND p.status = 'activo'
-      AND t.id NOT IN (SELECT task_id FROM assignments WHERE user_id = ?)
-    ORDER BY projectName, wbs, taskName`).all(userId, userId);
+    SELECT ${TASK_COLUMNS}, a.planned_hours AS plannedHours, (a.id IS NOT NULL) AS assigned
+    FROM ${TASK_FROM}
+    LEFT JOIN assignments a ON a.task_id = t.id AND a.user_id = ?
+    WHERE t.active = 1 AND t.is_summary = 0 AND p.status NOT IN (${CLOSED_SQL})
+      AND (p.is_internal = 1 OR p.pm_id = ? OR EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = p.id AND pm.user_id = ?))
+    ORDER BY p.is_internal, p.name, t.wbs, t.id`).all(userId, userId, userId);
+}
+
+export function holidaysBetween(db, from, to) {
+  return db.prepare('SELECT date, name FROM holidays WHERE date BETWEEN ? AND ? ORDER BY date').all(from, to);
 }
 
 export function normalizeWeek(value) {
@@ -41,13 +45,13 @@ export function normalizeWeek(value) {
 
 export function loadWeek(db, userId, week) {
   const days = weekDays(week);
-  const end = days[6];
+  const end = days[days.length - 1];
   const ts = getTimesheet(db, userId, week);
   const entries = ts ? db.prepare('SELECT task_id, work_date, hours, note FROM time_entries WHERE timesheet_id = ?').all(ts.id) : [];
   const allowed = allowedTasks(db, userId);
 
   const rows = new Map();
-  const toRow = (t) => ({ ...t, hours: {}, note: '' });
+  const toRow = (t) => ({ ...t, assigned: !!t.assigned, isAdmin: !!t.isAdmin, reducesAvailability: !!t.reducesAvailability, hours: {}, note: '' });
   // Tareas asignadas cuyo periodo planeado toca esta semana.
   for (const t of allowed) {
     if (!t.assigned) continue;
@@ -57,9 +61,8 @@ export function loadWeek(db, userId, week) {
   // Tareas con horas ya capturadas (aunque ya no estén asignadas o activas).
   const missing = [...new Set(entries.map((e) => e.task_id))].filter((id) => !rows.has(id));
   for (const id of missing) {
-    const known = allowed.find((t) => t.taskId === id);
-    const t = known || db.prepare(`SELECT ${TASK_COLUMNS}, NULL AS plannedHours, 0 AS assigned
-      FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ?`).get(id);
+    const t = allowed.find((x) => x.taskId === id)
+      || db.prepare(`SELECT ${TASK_COLUMNS}, NULL AS plannedHours, 0 AS assigned FROM ${TASK_FROM} WHERE t.id = ?`).get(id);
     if (t) rows.set(id, toRow(t));
   }
   for (const e of entries) {
@@ -73,18 +76,22 @@ export function loadWeek(db, userId, week) {
   const loggedMap = new Map(logged.map((r) => [r.task_id, r.h]));
   const withTotals = (t) => ({ ...t, loggedToDate: loggedMap.get(t.taskId) || 0 });
 
-  const capacity = db.prepare('SELECT weekly_capacity FROM users WHERE id = ?').get(userId)?.weekly_capacity ?? 40;
+  const capacity = db.prepare('SELECT weekly_capacity FROM users WHERE id = ?').get(userId)?.weekly_capacity ?? 45;
+  const holidays = holidaysBetween(db, week, end);
   return {
     week,
     days,
+    holidays,
     prevWeek: addDays(week, -7),
     nextWeek: addDays(week, 7),
     capacity,
+    // Horas que el consultor debe cubrir: la capacidad semanal menos los días festivos.
+    required: Math.max(capacity - (capacity / days.length) * holidays.length, 0),
     timesheet: ts
       ? { id: ts.id, status: ts.status, submittedAt: ts.submitted_at, reviewedAt: ts.reviewed_at, reviewComment: ts.review_comment }
       : { id: null, status: 'borrador' },
     rows: [...rows.values()].map(withTotals),
-    available: allowed.filter((t) => !rows.has(t.taskId)).map(withTotals),
+    available: allowed.filter((t) => !rows.has(t.taskId)).map(toRow).map(withTotals),
   };
 }
 
@@ -111,12 +118,12 @@ export function saveWeek(db, userId, week, rows) {
       if (seen.has(taskId)) throw new ValidationError('Hay una tarea repetida en el timesheet');
       seen.add(taskId);
       if (!allowedIds.has(taskId) && !previousIds.has(taskId)) {
-        throw new ValidationError(`No tienes asignada la tarea ${taskId}; pide a tu líder que te asigne en Project`, 403);
+        throw new ValidationError(`No tienes acceso a la tarea ${taskId}; pide al gestor del proyecto que te dé acceso`, 403);
       }
       const note = row.note ? String(row.note).slice(0, 500) : null;
       for (const [date, raw] of Object.entries(row.hours || {})) {
         if (raw === '' || raw == null) continue;
-        if (!days.has(date)) throw new ValidationError(`La fecha ${date} no pertenece a la semana ${week}`);
+        if (!days.has(date)) throw new ValidationError(`La fecha ${date} no es un día hábil (lunes a viernes) de la semana ${week}`);
         const hours = Number(raw);
         if (!Number.isFinite(hours) || hours < 0 || hours > 24) throw new ValidationError(`Horas inválidas el ${date}: ${raw}`);
         const rounded = Math.round(hours * 4) / 4; // cuartos de hora

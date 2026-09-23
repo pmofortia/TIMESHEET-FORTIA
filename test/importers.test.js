@@ -5,7 +5,7 @@ import { durationToHours, parseMspdi } from '../src/importers/mspdi.js';
 import { parseCsvText, parseDate, parseTaskCsv } from '../src/importers/csv.js';
 import { openDb } from '../src/db.js';
 import { hashPassword } from '../src/auth.js';
-import { applyPlan, plansFromCsv } from '../src/services/plans.js';
+import { applyPlan, plansFromCsv, rebuildAssignments } from '../src/services/plans.js';
 
 test('durationToHours interpreta las duraciones de Project', () => {
   assert.equal(durationToHours('PT40H0M0S'), 40);
@@ -55,9 +55,20 @@ test('applyPlan es idempotente, vincula por correo y desactiva tareas eliminadas
   const first = applyPlan(db, plan, { source: 'msproject' });
   assert.equal(first.created, true);
   assert.equal(first.tasksCreated, 12);
-  // Ana por correo (sin importar mayúsculas); María por nombre sin acentos.
-  assert.deepEqual(first.matchedResources.map((m) => m.user).sort(), ['Ana López', 'Maria Hernandez']);
-  assert.equal(first.unmatchedResources.length, 2);
+  // Ana por correo (sin importar mayúsculas); María por nombre sin acentos. Los demás quedan guardados sin usuario.
+  assert.deepEqual(first.resources.filter((r) => r.user).map((m) => m.user).sort(), ['Ana López', 'Maria Hernandez']);
+  assert.equal(first.resources.filter((r) => !r.user).length, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM project_resources').get().n, 4);
+  // Quedan con acceso al proyecto los usuarios vinculados.
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM project_members').get().n, 2);
+
+  // Reemplazo manual: el recurso "Carlos Ramírez" lo cubre Ana; la reimportación respeta el reemplazo.
+  const carlosRes = db.prepare("SELECT id FROM project_resources WHERE name = 'Carlos Ramírez'").get().id;
+  const anaId = db.prepare("SELECT id FROM users WHERE name = 'Ana López'").get().id;
+  db.prepare('UPDATE project_resources SET user_id = ? WHERE id = ?').run(anaId, carlosRes);
+  rebuildAssignments(db, first.project.id);
+  const interfaces = db.prepare("SELECT id FROM tasks WHERE name = 'Desarrollo de interfaces'").get().id;
+  assert.equal(db.prepare('SELECT user_id FROM assignments WHERE task_id = ?').get(interfaces).user_id, anaId);
 
   const second = applyPlan(db, { ...plan, tasks: plan.tasks.filter((t) => t.uid !== '12') }, { source: 'msproject' });
   assert.equal(second.created, false);
@@ -66,6 +77,7 @@ test('applyPlan es idempotente, vincula por correo y desactiva tareas eliminadas
   assert.equal(second.tasksDeactivated, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM projects').get().n, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n, 12);
+  assert.equal(db.prepare('SELECT user_id FROM assignments WHERE task_id = ?').get(interfaces).user_id, anaId, 'el reemplazo sobrevive a la reimportación');
 });
 
 test('plansFromCsv agrupa por proyecto y suma horas por tarea', () => {

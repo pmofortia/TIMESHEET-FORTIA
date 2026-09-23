@@ -30,8 +30,9 @@ export function weekStart(s) {
   return fmt(d);
 }
 
+// La semana laboral de Fortia es de lunes a viernes.
 export function weekDays(start) {
-  return Array.from({ length: 7 }, (_, i) => addDays(start, i));
+  return Array.from({ length: 5 }, (_, i) => addDays(start, i));
 }
 
 export function today() {

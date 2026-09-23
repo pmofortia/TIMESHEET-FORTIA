@@ -2,8 +2,6 @@
 // Es idempotente: reimportar el mismo archivo actualiza tareas y asignaciones
 // sin duplicar, y las tareas que ya no vienen en el archivo se desactivan
 // (no se borran, para conservar las horas ya registradas contra ellas).
-import { CATEGORY_KEYS } from '../db.js';
-
 export const normalizeName = (s) =>
   String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').trim();
 
@@ -25,9 +23,9 @@ function buildUserMatcher(db) {
 }
 
 /**
- * @param plan { name, code?, client?, category?, tasks:[{uid,name,wbs,outlineLevel,parentPath,start,finish,work,isSummary}],
+ * @param plan { name, code?, client?, clientId?, tasks:[{uid,name,wbs,outlineLevel,parentPath,start,finish,work,isSummary}],
  *               resources:[{uid,name,email}], assignments:[{taskUid,resourceUid,work}] }
- * @param opts { projectId?, source, dryRun? }
+ * @param opts { projectId?, source }
  */
 export function applyPlan(db, plan, opts) {
   const summary = {
@@ -37,31 +35,38 @@ export function applyPlan(db, plan, opts) {
     tasksUpdated: 0,
     tasksDeactivated: 0,
     assignments: 0,
-    matchedResources: [],
-    unmatchedResources: [],
+    resources: [],
     warnings: [],
   };
 
   let project;
   if (opts.projectId) {
-    project = db.prepare('SELECT * FROM projects WHERE id = ?').get(opts.projectId);
+    project = db.prepare('SELECT * FROM projects WHERE id = ? AND is_internal = 0').get(opts.projectId);
     if (!project) throw new Error('El proyecto destino no existe');
   } else {
     project =
-      (plan.code && db.prepare('SELECT * FROM projects WHERE code = ?').get(plan.code)) ||
-      db.prepare('SELECT * FROM projects WHERE lower(name) = lower(?)').get(plan.name);
+      (plan.code && db.prepare('SELECT * FROM projects WHERE code = ? AND is_internal = 0').get(plan.code)) ||
+      db.prepare('SELECT * FROM projects WHERE lower(name) = lower(?) AND is_internal = 0').get(plan.name);
   }
-  const category = CATEGORY_KEYS.includes(plan.category) ? plan.category : 'facturable';
+
+  // El cliente solo puede salir del catálogo de Administración.
+  let clientId = plan.clientId ? Number(plan.clientId) : null;
+  if (clientId && !db.prepare('SELECT 1 FROM clients WHERE id = ?').get(clientId)) throw new Error('El cliente seleccionado no existe');
+  if (!clientId && plan.client) {
+    clientId = db.prepare('SELECT id FROM clients WHERE name = ?').get(plan.client)?.id ?? null;
+    if (!clientId) summary.warnings.push(`El cliente "${plan.client}" no está en el catálogo; asígnalo en la ficha del proyecto`);
+  }
+
   if (!project) {
     const code = uniqueCode(db, plan.code || codeFromName(plan.name));
-    const r = db
-      .prepare('INSERT INTO projects (code, name, client, category, source, last_import_at) VALUES (?, ?, ?, ?, ?, datetime(\'now\'))')
-      .run(code, plan.name, plan.client || null, category, opts.source);
+    const salesExec = clientId ? db.prepare('SELECT sales_exec FROM clients WHERE id = ?').get(clientId).sales_exec : null;
+    const r = db.prepare(`INSERT INTO projects (code, name, client_id, sales_exec, source, last_import_at)
+      VALUES (?, ?, ?, ?, ?, datetime('now'))`).run(code, plan.name, clientId, salesExec, opts.source);
     project = db.prepare('SELECT * FROM projects WHERE id = ?').get(r.lastInsertRowid);
     summary.created = true;
   } else {
-    db.prepare(`UPDATE projects SET source = ?, last_import_at = datetime('now'), client = COALESCE(client, ?) WHERE id = ?`)
-      .run(opts.source, plan.client || null, project.id);
+    db.prepare(`UPDATE projects SET source = ?, last_import_at = datetime('now'), client_id = COALESCE(client_id, ?) WHERE id = ?`)
+      .run(opts.source, clientId, project.id);
   }
   summary.project = { id: project.id, code: project.code, name: project.name };
 
@@ -88,35 +93,52 @@ export function applyPlan(db, plan, opts) {
       summary.tasksCreated++;
     }
   }
-  const deactivate = db.prepare('UPDATE tasks SET active = 0 WHERE id = ? AND active = 1');
+  const deactivate = db.prepare("UPDATE tasks SET active = 0 WHERE id = ? AND active = 1 AND external_uid NOT LIKE 'manual:%'");
   for (const [uid, id] of existing) {
     if (!taskIds.has(uid) && deactivate.run(id).changes) summary.tasksDeactivated++;
   }
 
+  // Los recursos de Project se guardan tal cual. Si ya estaban ligados a un usuario (automático o
+  // reemplazado a mano) se respeta ese vínculo; si no, se intenta por correo y luego por nombre.
   const matchUser = buildUserMatcher(db);
-  const resourceUser = new Map();
+  const upsertResource = db.prepare(`INSERT INTO project_resources (project_id, uid, name, email, user_id) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (project_id, uid) DO UPDATE SET name = excluded.name, email = excluded.email,
+      user_id = COALESCE(project_resources.user_id, excluded.user_id)
+    RETURNING id, user_id`);
+  const resourceIds = new Map();
   for (const r of plan.resources) {
-    const u = matchUser(r);
-    if (u) {
-      resourceUser.set(r.uid, u.id);
-      summary.matchedResources.push({ resource: r.name, user: u.name });
-    } else {
-      summary.unmatchedResources.push({ resource: r.name, email: r.email });
-    }
+    const row = upsertResource.get(project.id, r.uid, r.name, r.email || null, matchUser(r)?.id ?? null);
+    resourceIds.set(r.uid, row.id);
+    const user = row.user_id ? db.prepare('SELECT name FROM users WHERE id = ?').get(row.user_id) : null;
+    summary.resources.push({ resource: r.name, email: r.email || null, user: user?.name || null });
   }
 
-  const clearAssign = db.prepare('DELETE FROM assignments WHERE task_id = ?');
-  for (const id of taskIds.values()) clearAssign.run(id);
-  const upsertAssign = db.prepare(`INSERT INTO assignments (task_id, user_id, planned_hours) VALUES (?, ?, ?)
-    ON CONFLICT (task_id, user_id) DO UPDATE SET planned_hours = planned_hours + excluded.planned_hours`);
+  const clearPlan = db.prepare('DELETE FROM plan_assignments WHERE task_id = ?');
+  for (const id of taskIds.values()) clearPlan.run(id);
+  const insPlan = db.prepare(`INSERT INTO plan_assignments (task_id, resource_id, planned_hours) VALUES (?, ?, ?)
+    ON CONFLICT (task_id, resource_id) DO UPDATE SET planned_hours = planned_hours + excluded.planned_hours`);
   for (const a of plan.assignments) {
     const taskId = taskIds.get(a.taskUid);
-    const userId = resourceUser.get(a.resourceUid);
-    if (!taskId || !userId) continue;
-    upsertAssign.run(taskId, userId, a.work ?? 0);
-    summary.assignments++;
+    const resourceId = resourceIds.get(a.resourceUid);
+    if (taskId && resourceId) insPlan.run(taskId, resourceId, a.work ?? 0);
   }
+  summary.assignments = rebuildAssignments(db, project.id);
   return summary;
+}
+
+// Recalcula las asignaciones efectivas (tarea-usuario) de las tareas que vienen del plan,
+// a partir de los recursos y el usuario que cubre cada uno. Da acceso al proyecto a esos usuarios.
+export function rebuildAssignments(db, projectId) {
+  db.prepare(`DELETE FROM assignments WHERE task_id IN
+    (SELECT id FROM tasks WHERE project_id = ? AND external_uid NOT LIKE 'manual:%')`).run(projectId);
+  const r = db.prepare(`INSERT INTO assignments (task_id, user_id, planned_hours)
+    SELECT pa.task_id, pr.user_id, SUM(pa.planned_hours)
+    FROM plan_assignments pa JOIN project_resources pr ON pr.id = pa.resource_id JOIN tasks t ON t.id = pa.task_id
+    WHERE t.project_id = ? AND pr.user_id IS NOT NULL
+    GROUP BY pa.task_id, pr.user_id`).run(projectId);
+  db.prepare(`INSERT OR IGNORE INTO project_members (project_id, user_id)
+    SELECT project_id, user_id FROM project_resources WHERE project_id = ? AND user_id IS NOT NULL`).run(projectId);
+  return Number(r.changes);
 }
 
 // Convierte las filas del CSV en uno o varios planes (uno por proyecto).
@@ -126,7 +148,7 @@ export function plansFromCsv(items) {
     const key = it.projectCode || normalizeName(it.project);
     if (!plans.has(key)) {
       plans.set(key, {
-        name: it.project, code: it.projectCode, client: it.client, category: it.category,
+        name: it.project, code: it.projectCode, client: it.client,
         tasks: new Map(), resources: new Map(), assignments: [],
       });
     }

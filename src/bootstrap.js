@@ -1,27 +1,22 @@
 import { randomBytes } from 'node:crypto';
 import { hashPassword } from './auth.js';
+import { DEFAULT_ADMIN_TASKS, DEFAULT_MODULES, INTERNAL_PROJECT_CODE } from './db.js';
 
-// Actividades no ligadas a un proyecto de cliente, disponibles para todos.
-export const INTERNAL_ACTIVITIES = [
-  ['INT-PREVENTA', 'Preventa y propuestas', 'preventa'],
-  ['INT-CAPACITACION', 'Capacitación y certificaciones', 'capacitacion'],
-  ['INT-JUNTAS', 'Juntas internas', 'interno'],
-  ['INT-DESARROLLO', 'Iniciativas internas / mejora', 'interno'],
-  ['INT-ADMIN', 'Administrativo', 'administrativo'],
-  ['INT-VACACIONES', 'Vacaciones', 'ausencia'],
-  ['INT-PERMISO', 'Permiso / incapacidad', 'ausencia'],
-  ['INT-FESTIVO', 'Día festivo', 'ausencia'],
-];
-
+// Datos mínimos para operar. Los catálogos iniciales solo se cargan la primera vez:
+// después los administra el usuario desde "Administración" (si borra uno, no reaparece).
 export function ensureBaseData(db, { log = console.log, auth = { microsoft: null, localEnabled: true } } = {}) {
-  let project = db.prepare("SELECT id FROM projects WHERE code = 'FORTIA-INT'").get();
+  let project = db.prepare('SELECT id FROM projects WHERE is_internal = 1').get();
   if (!project) {
-    const r = db.prepare(`INSERT INTO projects (code, name, client, category, open_to_all, source)
-      VALUES ('FORTIA-INT', 'Actividades internas Fortia', 'Fortia', 'interno', 1, 'manual')`).run();
+    const r = db.prepare(`INSERT INTO projects (code, name, status, is_internal, source)
+      VALUES (?, 'Tareas administrativas', 'Activo', 1, 'manual')`).run(INTERNAL_PROJECT_CODE);
     project = { id: Number(r.lastInsertRowid) };
+    const ins = db.prepare('INSERT INTO tasks (project_id, external_uid, name, reduces_availability) VALUES (?, ?, ?, ?)');
+    DEFAULT_ADMIN_TASKS.forEach(([name, reduces], i) => ins.run(project.id, `admin:${i + 1}`, name, reduces));
   }
-  const ins = db.prepare(`INSERT OR IGNORE INTO tasks (project_id, external_uid, name, category) VALUES (?, ?, ?, ?)`);
-  for (const [uid, name, category] of INTERNAL_ACTIVITIES) ins.run(project.id, uid, name, category);
+  if (!db.prepare('SELECT COUNT(*) AS n FROM modules').get().n) {
+    const ins = db.prepare('INSERT INTO modules (code, name) VALUES (?, ?)');
+    for (const [code, name] of DEFAULT_MODULES) ins.run(code, name);
+  }
 
   const admins = db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").get().n;
   if (!admins && !auth.localEnabled) {

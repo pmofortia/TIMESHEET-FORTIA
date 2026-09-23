@@ -1,6 +1,6 @@
 // Importación alternativa desde CSV/Excel (para quien exporta de Project a
 // Excel o arma el plan a mano). Una fila por asignación:
-//   proyecto, tarea, inicio, fin, horas_planeadas, recurso_email[, recurso, cliente, rubro, codigo_proyecto]
+//   proyecto, tarea, inicio, fin, horas_planeadas, recurso_email[, recurso, cliente, codigo_proyecto]
 
 export function parseCsvText(text) {
   const src = text.replace(/^﻿/, '');
@@ -35,7 +35,6 @@ const ALIASES = {
   proyecto: ['proyecto', 'project', 'nombre_proyecto'],
   codigo_proyecto: ['codigo_proyecto', 'codigo', 'clave_proyecto', 'project_code'],
   cliente: ['cliente', 'client'],
-  rubro: ['rubro', 'categoria', 'category'],
   tarea: ['tarea', 'task', 'nombre_tarea', 'actividad', 'nombre'],
   inicio: ['inicio', 'start', 'fecha_inicio', 'comienzo'],
   fin: ['fin', 'finish', 'fecha_fin', 'end'],
@@ -87,7 +86,6 @@ export function parseTaskCsv(text) {
       project: get(r, 'proyecto'),
       projectCode: get(r, 'codigo_proyecto') || null,
       client: get(r, 'cliente') || null,
-      category: get(r, 'rubro').toLowerCase() || null,
       task: get(r, 'tarea'),
       start: parseDate(get(r, 'inicio')),
       finish: parseDate(get(r, 'fin')),

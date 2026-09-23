@@ -4,7 +4,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-const state = { me: null, categories: [], today: null, dirty: false, pending: 0, auth: { microsoft: false, local: true, errors: {} } };
+const state = { me: null, meta: {}, today: null, dirty: false, pending: 0, auth: { microsoft: false, local: true, errors: {} } };
 
 // ---------- Utilidades ----------
 const nf = new Intl.NumberFormat('es-MX', { maximumFractionDigits: 2 });
@@ -19,11 +19,16 @@ const weekStart = (s) => { const d = parseD(s); return addDays(s, -((d.getUTCDay
 const fmtDay = (s) => { const d = parseD(s); return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`; };
 const fmtDate = (s) => (s ? `${fmtDay(s)} ${s.slice(0, 4)}` : '—');
 const dow = (s) => DAYS[parseD(s).getUTCDay()];
-const isWeekend = (s) => [0, 6].includes(parseD(s).getUTCDay());
-const catLabel = (k) => state.categories.find((c) => c.key === k)?.label || k;
-const catShort = { facturable: 'Facturable', preventa: 'Preventa', interno: 'Interno', capacitacion: 'Capacitación', administrativo: 'Administrativo', ausencia: 'Ausencia' };
-const catColor = (k) => `var(--cat-${k})`;
-const dot = (k) => `<span class="cat-dot" style="background:${catColor(k)}"></span>`;
+// Tipos de hora: proyecto (facturable), administrativa que descuenta disponibilidad y otra administrativa.
+const KINDS = {
+  project: { label: 'Proyectos', color: 'var(--kind-project)' },
+  deduct: { label: 'Administrativo que descuenta disponibilidad', short: 'Adm. (descuenta)', color: 'var(--kind-deduct)' },
+  admin: { label: 'Otro administrativo', short: 'Adm. (otro)', color: 'var(--kind-admin)' },
+};
+const rowKind = (r) => (r.isAdmin ? (r.reducesAvailability ? 'deduct' : 'admin') : 'project');
+const dot = (kind) => `<span class="cat-dot" style="background:${KINDS[kind].color}"></span>`;
+const roleLabel = (r) => state.meta.roleLabels?.[r] || r;
+const money = new Intl.NumberFormat('es-MX', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 const statusBadge = (s) => `<span class="status ${esc(s.replace(' ', '-'))}">${esc(s[0].toUpperCase() + s.slice(1))}</span>`;
 const isManager = () => ['lider', 'admin'].includes(state.me?.role);
 
@@ -76,7 +81,7 @@ async function boot() {
   } catch { /* se usa la configuración por defecto */ }
   try {
     const data = await api('GET', '/me');
-    Object.assign(state, { me: data.user, categories: data.categories, today: data.today });
+    Object.assign(state, { me: data.user, meta: data, today: data.today });
     renderShell();
     route();
   } catch {
@@ -128,13 +133,14 @@ const NAV = [
   { href: '#/semana', label: 'Mi semana', match: 'semana' },
   { href: '#/aprobaciones', label: 'Aprobaciones', match: 'aprobaciones', manager: true, badge: true },
   { href: '#/indicadores', label: 'Indicadores', match: 'indicadores' },
-  { href: '#/proyectos', label: 'Proyectos', match: 'proyectos', manager: true },
+  { href: '#/proyectos', label: 'Proyectos', match: 'proyectos' },
   { href: '#/importar', label: 'Importar de Project', match: 'importar', manager: true },
+  { href: '#/administracion', label: 'Administración', match: 'administracion', admin: true },
   { href: '#/usuarios', label: 'Usuarios', match: 'usuarios', admin: true },
 ];
 
 function renderShell() {
-  const roleLabel = { consultor: 'Consultor', lider: 'Líder de proyecto', admin: 'Administrador' }[state.me.role];
+
   $('#app').innerHTML = `
     <div class="shell">
       <aside class="sidebar">
@@ -144,7 +150,7 @@ function renderShell() {
           ${NAV.filter((n) => (!n.manager || isManager()) && (!n.admin || state.me.role === 'admin'))
             .map((n) => `<a href="${n.href}" data-match="${n.match}">${n.label}${n.badge ? '<span class="badge-count hidden" id="pending-badge"></span>' : ''}</a>`).join('')}
         </nav>
-        <div class="me"><b>${esc(state.me.name)}</b><span>${roleLabel}</span>
+        <div class="me"><b>${esc(state.me.name)}</b><span>${esc(roleLabel(state.me.role))}</span>
           <div class="row">${state.auth.local && state.me.authProvider !== 'microsoft' ? '<button id="btn-password" type="button">Contraseña</button>' : ''}<button id="btn-logout" type="button">Salir</button></div></div>
       </aside>
       <main class="main" id="main"></main>
@@ -186,6 +192,7 @@ function route() {
     indicadores: viewMetrics,
     proyectos: () => (arg ? viewProject(arg) : viewProjects()),
     importar: viewImport,
+    administracion: () => viewAdmin(arg),
     usuarios: viewUsers,
   };
   (views[section] || views.semana)().catch((err) => { main.innerHTML = `<div class="notice">${esc(err.message)}</div>`; });
@@ -194,6 +201,7 @@ function route() {
 // ---------- Grid semanal (compartido entre captura y revisión) ----------
 function gridHtml(sheet, editable) {
   const { days, rows } = sheet;
+  const holiday = Object.fromEntries((sheet.holidays || []).map((h) => [h.date, h.name]));
   const byDay = Object.fromEntries(days.map((d) => [d, 0]));
   let grand = 0;
   const body = rows.map((r) => {
@@ -201,18 +209,22 @@ function gridHtml(sheet, editable) {
     const cells = days.map((d) => {
       const h = Number(r.hours[d] || 0);
       total += h; byDay[d] += h;
-      return `<td class="day ${isWeekend(d) ? 'weekend' : ''}"><input class="h" type="number" inputmode="decimal" min="0" max="24" step="0.25"
+      return `<td class="day ${holiday[d] ? 'holiday' : ''}"><input class="h" type="number" inputmode="decimal" min="0" max="24" step="0.25"
         data-task="${r.taskId}" data-date="${d}" value="${h || ''}" aria-label="${esc(r.taskName)} ${dow(d)} ${fmtDay(d)}" ${editable ? '' : 'disabled'}></td>`;
     }).join('');
     grand += total;
     const planned = r.plannedHours != null ? ` · plan ${fmtH(r.plannedHours)} · acumulado ${fmtH(r.loggedToDate)}` : '';
     const dates = r.start ? ` · ${fmtDay(r.start)} – ${fmtDate(r.finish)}` : '';
     const over = r.plannedHours && r.loggedToDate > r.plannedHours;
+    const kind = rowKind(r);
+    const where = r.isAdmin
+      ? `Tarea administrativa${r.reducesAvailability ? ' · descuenta disponibilidad' : ''}`
+      : `${esc(r.projectCode)} · ${esc(r.projectName)}${r.parentPath ? ` › ${esc(r.parentPath)}` : ''}`;
     return `<tr data-row="${r.taskId}">
       <td class="task">
-        <div class="task-name">${dot(r.category)}${esc(r.taskName)}</div>
-        <div class="task-meta">${esc(r.projectCode)} · ${esc(r.projectName)}${r.parentPath ? ` › ${esc(r.parentPath)}` : ''}</div>
-        <div class="task-meta ${over ? 'over' : ''}">${esc(catShort[r.category] || r.category)}${dates}${planned}${over ? ' · excede lo planeado' : ''}</div>
+        <div class="task-name">${dot(kind)}${esc(r.taskName)}</div>
+        <div class="task-meta">${where}</div>
+        ${r.isAdmin ? '' : `<div class="task-meta ${over ? 'over' : ''}">${r.moduleCode ? `Módulo ${esc(r.moduleCode)}` : 'Sin módulo'}${dates}${planned}${over ? ' · excede lo planeado' : ''}${r.assigned ? '' : ' · no asignada en Project'}</div>`}
         ${editable ? `<input class="note" data-note="${r.taskId}" placeholder="Nota (opcional)" maxlength="500" value="${esc(r.note)}">` : r.note ? `<div class="task-meta">“${esc(r.note)}”</div>` : ''}
       </td>
       ${cells}
@@ -223,9 +235,9 @@ function gridHtml(sheet, editable) {
   return `
     <div class="table-wrap"><table class="ts-table">
       <thead><tr><th>Proyecto / tarea</th>
-        ${days.map((d) => `<th class="day ${isWeekend(d) ? 'weekend' : ''}">${dow(d)}<span class="date">${fmtDay(d)}</span></th>`).join('')}
+        ${days.map((d) => `<th class="day ${holiday[d] ? 'holiday' : ''}" ${holiday[d] ? `data-tip="<b>Día festivo</b>${esc(holiday[d])}"` : ''}>${dow(d)}<span class="date">${fmtDay(d)}</span>${holiday[d] ? '<span class="date hol">Festivo</span>' : ''}</th>`).join('')}
         <th class="num">Total</th>${editable ? '<th></th>' : ''}</tr></thead>
-      <tbody>${body || `<tr><td colspan="10" class="muted">No tienes tareas asignadas en esta semana. Agrega una actividad abajo.</td></tr>`}</tbody>
+      <tbody>${body || `<tr><td colspan="${days.length + 3}" class="muted">No tienes tareas asignadas en esta semana. Agrega una actividad abajo.</td></tr>`}</tbody>
       <tfoot><tr><td>Total del día</td>
         ${days.map((d) => `<td class="num day ${byDay[d] > 24 ? 'over' : ''}" data-daytotal="${d}">${nf.format(byDay[d])}</td>`).join('')}
         <td class="num" id="grand-total">${nf.format(grand)}</td>${editable ? '<td></td>' : ''}</tr></tfoot>
@@ -248,12 +260,12 @@ function renderWeek(sheet) {
   const editable = ['borrador', 'rechazado'].includes(sheet.timesheet.status);
   const total = () => sheet.rows.reduce((s, r) => s + Object.values(r.hours).reduce((a, b) => a + Number(b || 0), 0), 0);
   const groups = {};
-  for (const t of sheet.available) (groups[`${t.projectCode} · ${t.projectName}`] ||= []).push(t);
+  for (const t of sheet.available) (groups[t.isAdmin ? 'Tareas administrativas' : `${t.projectCode} · ${t.projectName}`] ||= []).push(t);
 
   main.innerHTML = `
     <div class="page-head">
-      <div><h1>Semana del ${fmtDay(sheet.days[0])} al ${fmtDate(sheet.days[6])}</h1>
-        <div class="sub">Capacidad semanal: ${fmtH(sheet.capacity)} · ${statusBadge(sheet.timesheet.status)}</div></div>
+      <div><h1>Semana del ${fmtDay(sheet.days[0])} al ${fmtDate(sheet.days.at(-1))}</h1>
+        <div class="sub">Horas a cubrir: <b>${fmtH(sheet.required)}</b>${sheet.holidays.length ? ` (${fmtH(sheet.capacity)} − ${sheet.holidays.length} festivo${sheet.holidays.length > 1 ? 's' : ''}: ${sheet.holidays.map((h) => esc(h.name)).join(', ')})` : ''} · ${statusBadge(sheet.timesheet.status)}</div></div>
       <div class="row">
         <a class="btn" href="#/semana/${sheet.prevWeek}" aria-label="Semana anterior">← Anterior</a>
         <a class="btn" href="#/semana/${weekStart(state.today)}">Hoy</a>
@@ -261,8 +273,8 @@ function renderWeek(sheet) {
         <input type="date" id="jump" value="${sheet.week}" aria-label="Ir a fecha">
       </div>
     </div>
-    ${sheet.timesheet.status === 'rechazado' ? `<div class="notice"><b>Tu líder rechazó este timesheet.</b> ${esc(sheet.timesheet.reviewComment || '')}</div>` : ''}
-    ${sheet.timesheet.status === 'enviado' ? '<div class="notice info">Enviado a aprobación. Si necesitas corregirlo, pide a tu líder que lo reabra.</div>' : ''}
+    ${sheet.timesheet.status === 'rechazado' ? `<div class="notice"><b>Tu gestor rechazó este timesheet.</b> ${esc(sheet.timesheet.reviewComment || '')}</div>` : ''}
+    ${sheet.timesheet.status === 'enviado' ? '<div class="notice info">Enviado a aprobación. Si necesitas corregirlo, pide a tu gestor que lo reabra.</div>' : ''}
     <div class="card">
       <div id="grid">${gridHtml(sheet, editable)}</div>
       ${editable ? `
@@ -270,7 +282,7 @@ function renderWeek(sheet) {
         <select id="add-task" aria-label="Agregar actividad">
           <option value="">+ Agregar actividad…</option>
           ${Object.entries(groups).map(([g, ts]) => `<optgroup label="${esc(g)}">${ts.map((t) =>
-            `<option value="${t.taskId}">${esc(t.taskName)}${t.assigned ? '' : ' (abierta)'}</option>`).join('')}</optgroup>`).join('')}
+            `<option value="${t.taskId}">${esc(t.taskName)}${t.isAdmin || t.assigned ? '' : ' (no asignada)'}</option>`).join('')}</optgroup>`).join('')}
         </select>
         <button type="button" id="copy-prev">Copiar tareas de la semana anterior</button>
         <span class="spacer"></span>
@@ -279,8 +291,8 @@ function renderWeek(sheet) {
         <button type="button" class="primary" id="submit">Enviar a aprobación</button>
       </div>` : ''}
     </div>
-    <p class="small muted">Solo aparecen las tareas que Project te asigna en las fechas de esta semana, más las que ya tengan horas.
-      Las actividades internas (capacitación, preventa, vacaciones…) están abiertas para todos.</p>`;
+    <p class="small muted">La semana va de lunes a viernes. Se precargan las tareas que Project te asigna en estas fechas; con
+      "Agregar actividad" puedes sumar otras tareas de los proyectos a los que tienes acceso o una tarea administrativa.</p>`;
 
   $('#jump').onchange = (e) => { if (e.target.value) location.hash = `#/semana/${weekStart(e.target.value)}`; };
   if (!editable) return;
@@ -288,8 +300,8 @@ function renderWeek(sheet) {
   const updateHint = () => {
     const t = total();
     const hint = $('#cap-hint');
-    hint.textContent = `${fmtH(t)} de ${fmtH(sheet.capacity)}`;
-    hint.className = t > sheet.capacity + 0.01 ? 'over' : 'muted';
+    hint.textContent = `${fmtH(t)} de ${fmtH(sheet.required)}`;
+    hint.className = t + 0.01 < sheet.required ? 'muted' : t > sheet.required + 0.01 ? 'over' : 'ok';
   };
   updateHint();
 
@@ -352,7 +364,7 @@ function renderWeek(sheet) {
   $('#submit').onclick = async () => {
     const t = total();
     if (!t) return toast('Captura al menos una hora antes de enviar', true);
-    if (t < sheet.capacity && !confirm(`Registraste ${fmtH(t)} de ${fmtH(sheet.capacity)} de capacidad. ¿Enviar de todos modos?`)) return;
+    if (t + 0.01 < sheet.required && !confirm(`Registraste ${fmtH(t)} de las ${fmtH(sheet.required)} que debes cubrir esta semana. ¿Enviar de todos modos?`)) return;
     try {
       const fresh = await api('POST', `/timesheets/${sheet.week}/submit`, { rows: collectRows(sheet) });
       state.dirty = false;
@@ -391,7 +403,7 @@ async function viewReview(id) {
   const total = data.rows.reduce((a, r) => a + Object.values(r.hours).reduce((x, y) => x + y, 0), 0);
   $('#main').innerHTML = `
     <div class="page-head"><div><h1>${esc(data.user.name)}</h1>
-      <div class="sub">Semana del ${fmtDay(data.days[0])} al ${fmtDate(data.days[6])} · ${fmtH(total)} de ${fmtH(data.capacity)} · ${statusBadge(s)}</div></div>
+      <div class="sub">Semana del ${fmtDay(data.days[0])} al ${fmtDate(data.days.at(-1))} · ${fmtH(total)} de ${fmtH(data.required)} requeridas · ${statusBadge(s)}</div></div>
       <a class="btn" href="#/aprobaciones">← Volver</a></div>
     ${data.timesheet.reviewComment ? `<div class="notice info">Comentario: ${esc(data.timesheet.reviewComment)}</div>` : ''}
     <div class="card">${gridHtml({ ...data, rows: data.rows.filter((r) => Object.keys(r.hours).length) }, false)}
@@ -435,10 +447,10 @@ function barsH(items, { max, target, format = fmtH, width = 560 } = {}) {
     <line class="baseline" x1="${labelW}" x2="${labelW}" y1="0" y2="${h}"/>${rows}${t}</svg>`;
 }
 
-function stackedColumns(weekly, cats, { width = 1000, height = 260 } = {}) {
+function stackedColumns(weekly, series, { width = 1000, height = 260 } = {}) {
   const left = 40, bottom = 26, top = 10;
   const plotH = height - bottom - top;
-  const totals = weekly.map((w) => cats.reduce((s, c) => s + w[c], 0));
+  const totals = weekly.map((w) => series.reduce((s, c) => s + w[c], 0));
   const maxV = Math.max(...totals, 1);
   const step = maxV > 160 ? 40 : maxV > 80 ? 20 : 10;
   const yMax = Math.ceil(maxV / step) * step;
@@ -450,23 +462,22 @@ function stackedColumns(weekly, cats, { width = 1000, height = 260 } = {}) {
   const cols = weekly.map((w, i) => {
     const x = left + i * slot + (slot - barW) / 2;
     let acc = 0;
-    const segs = cats.filter((c) => w[c] > 0);
+    const segs = series.filter((c) => w[c] > 0);
     const rects = segs.map((c, j) => {
       const y0 = y(acc), y1 = y(acc + w[c]);
       acc += w[c];
       const hgt = Math.max(y0 - y1 - (j < segs.length - 1 ? 2 : 0), 1); // 2px de separación entre segmentos
-      const isTop = j === segs.length - 1;
-      const r = isTop ? Math.min(4, hgt / 2, barW / 2) : 0;
+      const r = j === segs.length - 1 ? Math.min(4, hgt / 2, barW / 2) : 0;
       const d = `M${x},${y0}v-${hgt - r}${r ? `a${r},${r} 0 0 1 ${r},-${r}h${barW - 2 * r}a${r},${r} 0 0 1 ${r},${r}` : `h${barW}`}v${hgt - r}z`;
-      return `<path class="mark" d="${d}" fill="${catColor(c)}" data-tip="<b>Semana ${fmtDay(w.week)}</b>${esc(catShort[c])}: ${fmtH(w[c])}<br>Total semana: ${fmtH(totals[i])}"/>`;
+      return `<path class="mark" d="${d}" fill="${KINDS[c].color}" data-tip="<b>Semana ${fmtDay(w.week)}</b>${esc(KINDS[c].label)}: ${fmtH(w[c])}<br>Total semana: ${fmtH(totals[i])}"/>`;
     }).join('');
     return `${rects}<text x="${x + barW / 2}" y="${height - 8}" text-anchor="middle">${fmtDay(w.week)}</text>`;
   }).join('');
-  return `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Horas por semana y rubro">
+  return `<svg class="chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Horas por semana">
     ${ticks.join('')}<line class="baseline" x1="${left}" x2="${width}" y1="${y(0)}" y2="${y(0)}"/>${cols}</svg>`;
 }
 
-const legend = (cats) => `<div class="legend">${cats.map((c) => `<span>${dot(c)}${esc(catShort[c])}</span>`).join('')}</div>`;
+const legend = (kinds) => `<div class="legend">${kinds.map((k) => `<span>${dot(k)}${esc(KINDS[k].label)}</span>`).join('')}</div>`;
 
 function presetRange(key) {
   const t = state.today;
@@ -482,22 +493,36 @@ function presetRange(key) {
   }
 }
 
+let catalogsCache = null;
+async function catalogs(force = false) {
+  if (!catalogsCache || force) catalogsCache = await api('GET', '/catalogs');
+  return catalogsCache;
+}
+
 async function viewMetrics() {
-  const [users, projects] = await Promise.all([api('GET', '/users'), api('GET', '/projects')]);
+  const [users, projects, cats] = await Promise.all([api('GET', '/users'), api('GET', '/projects'), catalogs(true)]);
   const params = new URLSearchParams(location.hash.split('?')[1] || '');
   const [dFrom, dTo] = presetRange('4s');
   const q = {
-    from: params.get('from') || dFrom, to: params.get('to') || dTo,
-    userId: params.get('userId') || '', projectId: params.get('projectId') || '', includeDrafts: params.get('includeDrafts') || '',
+    from: params.get('from') || dFrom, to: params.get('to') || dTo, userId: params.get('userId') || '',
+    projectId: params.get('projectId') || '', clientId: params.get('clientId') || '', includeDrafts: params.get('includeDrafts') || '',
   };
   const qs = new URLSearchParams(Object.entries(q).filter(([, v]) => v)).toString();
   const m = await api('GET', `/metrics?${qs}`);
-  const cats = state.categories.map((c) => c.key);
+  const k = m.kpis;
   const tracked = users.items.filter((u) => u.active && u.tracksTime);
+  const kinds = ['project', 'deduct', 'admin'];
+  const byKind = {
+    project: k.projectHours,
+    deduct: m.adminTasks.filter((t) => t.reducesAvailability).reduce((a, t) => a + t.hours, 0),
+    admin: m.adminTasks.filter((t) => !t.reducesAvailability).reduce((a, t) => a + t.hours, 0),
+  };
+  const share = (h) => pct(k.hours ? h / k.hours : 0);
+  const effMax = Math.max(1, ...m.people.map((u) => u.efficiency || 0));
 
   $('#main').innerHTML = `
-    <div class="page-head"><div><h1>Indicadores</h1><div class="sub">${fmtDate(m.range.from)} – ${fmtDate(m.range.to)} · ${m.range.weekdays} días hábiles ·
-      ${m.range.includeDrafts ? 'incluye borradores' : 'solo timesheets enviados y aprobados'}</div></div>
+    <div class="page-head"><div><h1>Indicadores</h1><div class="sub">${fmtDate(m.range.from)} – ${fmtDate(m.range.to)} · ${m.range.weekdays} días hábiles
+      ${m.range.holidays.length ? ` · ${m.range.holidays.length} festivo(s)` : ''} · ${m.range.includeDrafts ? 'incluye borradores' : 'solo timesheets enviados y aprobados'}</div></div>
       <a class="btn" href="/api/metrics/export.csv?${qs}">Exportar detalle CSV</a></div>
     <form class="filters" id="filters">
       <label class="field">Periodo<select name="preset"><option value="">Personalizado</option><option value="4s">Últimas 4 semanas</option>
@@ -506,6 +531,8 @@ async function viewMetrics() {
       <label class="field">Hasta<input type="date" name="to" value="${q.to}"></label>
       ${tracked.length > 1 ? `<label class="field">Consultor<select name="userId"><option value="">Todos</option>
         ${tracked.map((u) => `<option value="${u.id}" ${String(u.id) === q.userId ? 'selected' : ''}>${esc(u.name)}</option>`).join('')}</select></label>` : ''}
+      <label class="field">Cliente<select name="clientId"><option value="">Todos</option>
+        ${cats.clients.map((c) => `<option value="${c.id}" ${String(c.id) === q.clientId ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}</select></label>
       <label class="field">Proyecto<select name="projectId"><option value="">Todos</option>
         ${projects.items.map((p) => `<option value="${p.id}" ${String(p.id) === q.projectId ? 'selected' : ''}>${esc(p.code)} · ${esc(p.name)}</option>`).join('')}</select></label>
       <label class="check"><input type="checkbox" name="includeDrafts" value="1" ${q.includeDrafts ? 'checked' : ''}> Incluir borradores</label>
@@ -513,58 +540,72 @@ async function viewMetrics() {
     </form>
 
     <div class="kpis">
-      <div class="kpi"><div class="label">Cargabilidad</div><div class="value">${pct(m.kpis.utilization)}</div>
-        <div class="hint">Facturable / capacidad · meta ${pct(m.target)}</div></div>
-      <div class="kpi"><div class="label">Cargabilidad neta</div><div class="value">${pct(m.kpis.netUtilization)}</div>
-        <div class="hint">Descontando ausencias</div></div>
-      <div class="kpi"><div class="label">Horas registradas</div><div class="value">${nf.format(m.kpis.hours)}</div>
-        <div class="hint">${fmtH(m.kpis.billable)} facturables</div></div>
-      <div class="kpi"><div class="label">Capacidad</div><div class="value">${nf.format(m.kpis.capacity)}</div>
-        <div class="hint">${m.kpis.consultants} consultores</div></div>
-      <div class="kpi"><div class="label">Cumplimiento de timesheet</div><div class="value">${pct(m.kpis.compliance)}</div>
-        <div class="hint">Semanas cerradas enviadas a tiempo</div></div>
+      <div class="kpi"><div class="label">Eficiencia</div><div class="value">${pct(k.efficiency)}</div>
+        <div class="hint">Facturables / disponibilidad · meta ${pct(m.target)}</div></div>
+      <div class="kpi"><div class="label">Carga a proyectos</div><div class="value">${nf.format(k.projectHours)} h</div>
+        <div class="hint">${share(k.projectHours)} de lo registrado</div></div>
+      <div class="kpi"><div class="label">Carga administrativa</div><div class="value">${nf.format(k.adminHours)} h</div>
+        <div class="hint">${share(k.adminHours)} de lo registrado</div></div>
+      <div class="kpi"><div class="label">Disponibilidad</div><div class="value">${nf.format(k.availability)} h</div>
+        <div class="hint">de ${nf.format(k.capacity)} h de capacidad · ${k.consultants} consultores</div></div>
+      <div class="kpi"><div class="label">Horas sin registrar</div><div class="value">${nf.format(k.unregistered)} h</div>
+        <div class="hint">Cumplimiento de timesheet ${pct(k.compliance)}</div></div>
     </div>
 
     <div class="grid-2">
-      <div class="card"><h2>Horas por rubro</h2>
-        ${barsH(cats.map((c) => ({ label: catShort[c], value: m.byCategory[c], color: catColor(c),
-          tip: `<b>${esc(catLabel(c))}</b>${fmtH(m.byCategory[c])} · ${pct(m.kpis.hours ? m.byCategory[c] / m.kpis.hours : 0)} del total` })))}
+      <div class="card"><h2>Carga a proyectos vs. administrativa</h2>
+        ${barsH(kinds.map((kd) => ({ label: KINDS[kd].short || KINDS[kd].label, value: byKind[kd], color: KINDS[kd].color,
+          tip: `<b>${esc(KINDS[kd].label)}</b>${fmtH(byKind[kd])} · ${share(byKind[kd])} del total` })))}
+        <p class="small muted">"Descuenta disponibilidad": las tareas administrativas marcadas así en Administración (vacaciones y permisos, capacitación, etc.).</p>
       </div>
-      <div class="card"><h2>Cargabilidad por consultor</h2>
-        ${m.utilization.length ? barsH(m.utilization.map((u) => ({ label: u.name, value: u.utilization, color: 'var(--cat-facturable)',
-          tip: `<b>${esc(u.name)}</b>Cargabilidad ${pct(u.utilization)} (neta ${pct(u.netUtilization)})<br>${fmtH(u.billable)} facturables de ${fmtH(u.capacity)}<br>Ocupación total ${pct(u.occupancy)}` })),
-          { max: 1, target: m.target, format: pct }) : '<p class="muted">Sin consultores en el filtro.</p>'}
+      <div class="card"><h2>Eficiencia por consultor</h2>
+        ${m.people.length ? barsH(m.people.map((u) => ({ label: u.name, value: u.efficiency || 0, color: KINDS.project.color,
+          tip: `<b>${esc(u.name)}</b>Eficiencia ${pct(u.efficiency)}<br>${fmtH(u.projectHours)} facturables de ${fmtH(u.availability)} disponibles<br>Sin registrar: ${fmtH(u.unregistered)}` })),
+          { max: effMax, target: m.target, format: (v) => pct(v) }) : '<p class="muted">Sin consultores en el filtro.</p>'}
       </div>
     </div>
 
-    <div class="card" style="margin-top:16px"><h2>Tendencia semanal por rubro</h2>${legend(cats)}${stackedColumns(m.weekly, cats)}
+    <div class="card" style="margin-top:16px"><h2>Tendencia semanal</h2>${legend(kinds)}${stackedColumns(m.weekly, kinds)}
       <details class="table-view"><summary>Ver como tabla</summary><div class="table-wrap"><table>
-        <thead><tr><th>Semana</th>${cats.map((c) => `<th class="num">${catShort[c]}</th>`).join('')}</tr></thead>
-        <tbody>${m.weekly.map((w) => `<tr><td>${fmtDate(w.week)}</td>${cats.map((c) => `<td class="num">${nf.format(w[c])}</td>`).join('')}</tr>`).join('')}</tbody>
+        <thead><tr><th>Semana</th>${kinds.map((kd) => `<th class="num">${esc(KINDS[kd].short || KINDS[kd].label)}</th>`).join('')}</tr></thead>
+        <tbody>${m.weekly.map((w) => `<tr><td>${fmtDate(w.week)}</td>${kinds.map((kd) => `<td class="num">${nf.format(w[kd])}</td>`).join('')}</tr>`).join('')}</tbody>
       </table></div></details>
     </div>
 
-    <div class="card"><h2>Detalle por consultor</h2><div class="table-wrap"><table>
-      <thead><tr><th>Consultor</th><th class="num">Capacidad</th>${cats.map((c) => `<th class="num">${dot(c)}${catShort[c]}</th>`).join('')}
-        <th class="num">Total</th><th class="num">Cargab.</th><th class="num">Neta</th></tr></thead>
-      <tbody>${m.utilization.map((u) => `<tr><td>${esc(u.name)}<div class="small muted">${esc(u.area || '')}</div></td><td class="num">${nf.format(u.capacity)}</td>
-        ${cats.map((c) => `<td class="num">${nf.format(u.byCategory[c])}</td>`).join('')}
-        <td class="num"><b>${nf.format(u.hours)}</b></td><td class="num">${pct(u.utilization)}</td><td class="num">${pct(u.netUtilization)}</td></tr>`).join('')}</tbody>
-    </table></div></div>
+    <div class="grid-2">
+      <div class="card"><h2>Horas por tarea administrativa</h2>
+        ${m.adminTasks.length ? barsH(m.adminTasks.map((t) => ({ label: t.name, value: t.hours, color: KINDS[t.reducesAvailability ? 'deduct' : 'admin'].color,
+          tip: `<b>${esc(t.name)}</b>${fmtH(t.hours)}${t.reducesAvailability ? '<br>Descuenta disponibilidad' : ''}` }))) : '<p class="muted">Sin horas administrativas.</p>'}
+      </div>
+      <div class="card"><h2>Horas de proyecto por módulo</h2>
+        ${m.modules.length ? barsH(m.modules.map((x) => ({ label: x.code ? `${x.code} · ${x.name}` : x.name, value: x.hours, color: KINDS.project.color,
+          tip: `<b>${esc(x.name)}</b>${fmtH(x.hours)}` }))) : '<p class="muted">Sin horas de proyecto.</p>'}
+      </div>
+    </div>
 
-    <div class="card"><h2>Proyectos: plan vs. real</h2><div class="table-wrap"><table>
-      <thead><tr><th>Proyecto</th><th>Rubro</th><th class="num">Horas en periodo</th><th class="num">Real acumulado</th><th class="num">Planeado</th><th>Consumo del plan</th><th>Fechas</th></tr></thead>
-      <tbody>${m.projects.map((p) => `<tr><td><b>${esc(p.code)}</b> · ${esc(p.name)}<div class="small muted">${esc(p.client || '')}</div></td>
-        <td>${dot(p.category)}${esc(catShort[p.category])}</td><td class="num">${nf.format(p.hours)}</td><td class="num">${nf.format(p.actualToDate)}</td>
-        <td class="num">${p.planned ? nf.format(p.planned) : '—'}</td>
-        <td>${p.consumed != null ? `${pct(p.consumed)}<div class="progress ${p.consumed > 1 ? 'over' : ''}"><span style="width:${Math.min(p.consumed, 1) * 100}%"></span></div>` : '<span class="muted">sin plan</span>'}</td>
-        <td class="small">${p.start ? `${fmtDate(p.start)} – ${fmtDate(p.finish)}` : '—'}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">Sin horas en el periodo.</td></tr>'}</tbody>
+    <div class="card" style="margin-top:16px"><h2>Detalle por consultor</h2><div class="table-wrap"><table>
+      <thead><tr><th>Consultor</th><th class="num">Capacidad</th><th class="num">Festivos</th><th class="num">Descuentos</th><th class="num">Disponibilidad</th>
+        <th class="num">${dot('project')}Proyectos</th><th class="num">Administrativo</th><th class="num">Sin registrar</th><th class="num">Eficiencia</th></tr></thead>
+      <tbody>${m.people.map((u) => `<tr><td>${esc(u.name)}<div class="small muted">${esc(u.area || '')}</div></td>
+        <td class="num">${nf.format(u.capacity)}</td><td class="num">${nf.format(u.holidayHours)}</td><td class="num">${nf.format(u.deductHours)}</td>
+        <td class="num"><b>${nf.format(u.availability)}</b></td><td class="num">${nf.format(u.projectHours)}</td><td class="num">${nf.format(u.adminHours)}</td>
+        <td class="num">${nf.format(u.unregistered)}</td><td class="num"><b>${pct(u.efficiency)}</b></td></tr>`).join('')}</tbody>
+    </table></div>
+    <p class="small muted">Disponibilidad = capacidad − festivos − horas en tareas administrativas que descuentan disponibilidad. Eficiencia = horas en proyectos / disponibilidad.</p></div>
+
+    <div class="card"><h2>Proyectos: vendido vs. real</h2><div class="table-wrap"><table>
+      <thead><tr><th>Proyecto</th><th>Estatus</th><th class="num">Horas en periodo</th><th class="num">Real acumulado</th><th class="num">Planeado (Project)</th><th class="num">Vendidas</th><th>Consumo de lo vendido</th></tr></thead>
+      <tbody>${m.projects.map((p) => `<tr><td><a href="#/proyectos/${p.id}"><b>${esc(p.code)}</b></a> · ${esc(p.name)}<div class="small muted">${esc(p.client || 'Sin cliente')}</div></td>
+        <td class="small">${esc(p.status || '')}${p.stage ? `<div class="muted">${esc(p.stage)}</div>` : ''}</td>
+        <td class="num">${nf.format(p.hours)}</td><td class="num">${nf.format(p.actualToDate)}</td><td class="num">${p.planned ? nf.format(p.planned) : '—'}</td>
+        <td class="num">${p.sold != null ? nf.format(p.sold) : '—'}</td>
+        <td>${p.consumedSold != null ? `${pct(p.consumedSold)}<div class="progress ${p.consumedSold > 1 ? 'over' : ''}"><span style="width:${Math.min(p.consumedSold, 1) * 100}%"></span></div>` : '<span class="muted">sin horas vendidas</span>'}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">Sin horas de proyecto en el periodo.</td></tr>'}</tbody>
     </table></div></div>
 
     <div class="card"><h2>Cumplimiento semanal</h2>
       ${m.compliance.weeks.length ? `<div class="table-wrap"><table>
         <thead><tr><th>Consultor</th>${m.compliance.weeks.map((w) => `<th>${fmtDay(w)}</th>`).join('')}<th class="num">Cumplimiento</th></tr></thead>
-        <tbody>${m.compliance.rows.map((r) => `<tr><td>${esc(r.name)}</td>${r.weeks.map((s) => `<td>${statusBadge(s)}</td>`).join('')}
+        <tbody>${m.compliance.rows.map((r) => `<tr><td>${esc(r.name)}</td>${r.weeks.map((st) => `<td>${statusBadge(st)}</td>`).join('')}
           <td class="num">${r.done}/${r.expected}</td></tr>`).join('')}</tbody></table></div>`
         : '<p class="muted">Aún no hay semanas cerradas en el periodo.</p>'}
     </div>`;
@@ -579,107 +620,326 @@ async function viewMetrics() {
     e.preventDefault();
     const fd = new FormData(form);
     fd.delete('preset');
-    const p = new URLSearchParams([...fd.entries()].filter(([, v]) => v));
-    location.hash = `#/indicadores?${p}`;
+    location.hash = `#/indicadores?${new URLSearchParams([...fd.entries()].filter(([, v]) => v))}`;
   };
 }
 
 // ---------- Proyectos ----------
+const optionList = (items, selected, { value = (x) => x.id, label = (x) => x.name, empty } = {}) =>
+  `${empty !== undefined ? `<option value="">${esc(empty)}</option>` : ''}${items.map((x) =>
+    `<option value="${esc(value(x))}" ${String(value(x)) === String(selected ?? '') ? 'selected' : ''}>${esc(label(x))}</option>`).join('')}`;
+
 async function viewProjects() {
   const { items } = await api('GET', '/projects');
-  const sourceLabel = { msproject: 'MS Project', csv: 'CSV/Excel', manual: 'Manual' };
+  const params = new URLSearchParams(location.hash.split('?')[1] || '');
+  const status = params.get('estatus') || '';
+  const shown = status ? items.filter((p) => p.status === status) : items;
   $('#main').innerHTML = `
-    <div class="page-head"><div><h1>Proyectos</h1><div class="sub">Catálogo de proyectos y actividades</div></div>
-      <div class="row"><a class="btn" href="#/importar">Importar de Project</a><button class="primary" id="new-project">Nuevo proyecto</button></div></div>
+    <div class="page-head"><div><h1>Proyectos</h1><div class="sub">${state.me.role === 'admin' ? 'Todos los proyectos' : 'Proyectos a los que tienes acceso'}</div></div>
+      <div class="row">
+        <select id="status-filter" aria-label="Filtrar por estatus">${optionList(state.meta.statuses.map((x) => ({ id: x, name: x })), status, { empty: 'Todos los estatus' })}</select>
+        ${isManager() ? '<a class="btn" href="#/importar">Importar de Project</a><button class="primary" id="new-project">Nuevo proyecto</button>' : ''}
+      </div></div>
     <div class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Código</th><th>Proyecto</th><th>Cliente</th><th>Rubro</th><th>Origen</th><th class="num">Tareas</th><th class="num">Horas plan</th><th>Estatus</th></tr></thead>
-      <tbody>${items.map((p) => `<tr><td><a href="#/proyectos/${p.id}"><b>${esc(p.code)}</b></a></td><td>${esc(p.name)}${p.openToAll ? ' <span class="small muted">(abierto a todos)</span>' : ''}</td>
-        <td>${esc(p.client || '')}</td><td>${dot(p.category)}${esc(catShort[p.category])}</td>
-        <td>${sourceLabel[p.source] || esc(p.source)}${p.lastImportAt ? `<div class="small muted">${esc(p.lastImportAt.slice(0, 16))}</div>` : ''}</td>
-        <td class="num">${p.tasks}</td><td class="num">${nf.format(p.planned)}</td><td>${esc(p.status)}</td></tr>`).join('')}</tbody>
+      <thead><tr><th>Código</th><th>Proyecto</th><th>Cliente</th><th>Gestor</th><th>Estatus / etapa</th><th>Módulos</th><th class="num">Vendidas</th><th class="num">Real</th><th>Consumo</th></tr></thead>
+      <tbody>${shown.map((p) => {
+        const c = p.soldHours ? p.actual / p.soldHours : null;
+        return `<tr><td><a href="#/proyectos/${p.id}"><b>${esc(p.code)}</b></a></td><td>${esc(p.name)}</td>
+        <td>${esc(p.clientName || '—')}</td><td>${esc(p.pmName || '—')}</td>
+        <td class="small">${esc(p.status)}${p.stage ? `<div class="muted">${esc(p.stage)}</div>` : ''}</td>
+        <td class="small">${esc(p.moduleCodes || '—')}</td>
+        <td class="num">${p.soldHours != null ? nf.format(p.soldHours) : '—'}</td><td class="num">${nf.format(p.actual)}</td>
+        <td>${c != null ? `${pct(c)}<div class="progress ${c > 1 ? 'over' : ''}"><span style="width:${Math.min(c, 1) * 100}%"></span></div>` : ''}</td></tr>`;
+      }).join('') || '<tr><td colspan="9" class="muted">No tienes proyectos asignados. Pide acceso al gestor del proyecto.</td></tr>'}</tbody>
     </table></div></div>`;
-  $('#new-project').onclick = () => projectDialog();
+  $('#status-filter').onchange = (e) => { location.hash = e.target.value ? `#/proyectos?estatus=${encodeURIComponent(e.target.value)}` : '#/proyectos'; };
+  if ($('#new-project')) $('#new-project').onclick = () => projectDialog();
 }
 
-async function projectDialog(p = {}) {
-  const users = (await api('GET', '/users')).items.filter((u) => u.active && u.role !== 'consultor');
+async function projectDialog(p = {}, currentModules = []) {
+  const cats = await catalogs(true);
+  const selectedModules = new Set(currentModules.map((m) => m.id));
+  const lockPm = !!p.id && state.me.role !== 'admin';
   const dlg = document.createElement('dialog');
+  dlg.className = 'wide';
   dlg.innerHTML = `<form method="dialog" id="pform"><h2>${p.id ? 'Editar proyecto' : 'Nuevo proyecto'}</h2>
     <div class="form-grid">
-      <label class="field">Código<input name="code" required value="${esc(p.code || '')}"></label>
-      <label class="field">Nombre<input name="name" required value="${esc(p.name || '')}"></label>
-      <label class="field">Cliente<input name="client" value="${esc(p.client || '')}"></label>
-      <label class="field">Rubro<select name="category">${state.categories.map((c) => `<option value="${c.key}" ${c.key === (p.category || 'facturable') ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}</select></label>
-      <label class="field">Líder<select name="pmId"><option value="">—</option>${users.map((u) => `<option value="${u.id}" ${u.id === p.pmId ? 'selected' : ''}>${esc(u.name)}</option>`).join('')}</select></label>
-      <label class="field">Estatus<select name="status"><option value="activo">Activo</option><option value="cerrado" ${p.status === 'cerrado' ? 'selected' : ''}>Cerrado</option></select></label>
+      <label class="field">Código<input name="code" required maxlength="30" value="${esc(p.code || '')}"></label>
+      <label class="field" style="grid-column:span 2">Nombre del proyecto<input name="name" required value="${esc(p.name || '')}"></label>
+      <label class="field">Cliente<select name="clientId">${optionList(cats.clients, p.clientId, { empty: '— Selecciona —' })}</select></label>
+      <label class="field">Ejecutivo comercial<input name="salesExec" value="${esc(p.salesExec || '')}"></label>
+      <label class="field">Gestor de proyecto<select name="pmId" ${lockPm ? 'disabled' : ''}>${optionList(cats.managers, p.pmId ?? (state.me.role === 'lider' ? state.me.id : ''), { empty: '—' })}</select></label>
+      <label class="field">Estatus<select name="status">${optionList(cats.statuses.map((x) => ({ id: x, name: x })), p.status || 'Por asignar')}</select></label>
+      <label class="field">Etapa<select name="stage">${optionList(cats.stages.map((x) => ({ id: x, name: x })), p.stage, { empty: '—' })}</select></label>
+      <label class="field">Horas vendidas<input name="soldHours" type="number" min="0" step="0.5" value="${p.soldHours ?? ''}"></label>
+      <label class="field">Presupuesto (USD)<input name="budgetUsd" type="number" min="0" step="0.01" value="${p.budgetUsd ?? ''}"></label>
     </div>
-    <p><label class="check"><input type="checkbox" name="openToAll" ${p.openToAll ? 'checked' : ''}> Abierto a todos (cualquiera puede registrar sin asignación)</label></p>
+    <fieldset class="modules"><legend>Módulos</legend>
+      ${cats.modules.map((m) => `<label class="check"><input type="checkbox" name="moduleIds" value="${m.id}" ${selectedModules.has(m.id) ? 'checked' : ''}> ${esc(m.code)} · ${esc(m.name)}</label>`).join('')}
+    </fieldset>
+    ${lockPm ? '<p class="small muted">Solo un administrador puede cambiar al gestor del proyecto.</p>' : ''}
+    <p class="small muted" id="perror" role="alert"></p>
     <div class="row"><span class="spacer"></span><button value="cancel" formnovalidate>Cancelar</button><button class="primary" value="ok">Guardar</button></div></form>`;
   document.body.append(dlg);
+  const form = $('#pform', dlg);
+  form.clientId.onchange = () => {
+    const c = cats.clients.find((x) => String(x.id) === form.clientId.value);
+    if (c && !form.salesExec.value) form.salesExec.value = c.salesExec || '';
+  };
+  form.onsubmit = async (e) => {
+    if (e.submitter?.value !== 'ok') return;
+    e.preventDefault();
+    const f = new FormData(form);
+    const body = {
+      code: f.get('code'), name: f.get('name'), clientId: f.get('clientId') ? Number(f.get('clientId')) : null,
+      salesExec: f.get('salesExec'), pmId: lockPm ? p.pmId : (f.get('pmId') ? Number(f.get('pmId')) : null),
+      status: f.get('status'), stage: f.get('stage') || null, soldHours: f.get('soldHours'), budgetUsd: f.get('budgetUsd'),
+      moduleIds: f.getAll('moduleIds').map(Number),
+    };
+    try {
+      const r = await api(p.id ? 'PUT' : 'POST', p.id ? `/projects/${p.id}` : '/projects', body);
+      dlg.close();
+      toast('Proyecto guardado');
+      if (!p.id && r.id) location.hash = `#/proyectos/${r.id}`; else route();
+    } catch (err) { $('#perror', dlg).textContent = err.message; }
+  };
+  dlg.addEventListener('close', () => dlg.remove());
   dlg.showModal();
-  dlg.addEventListener('close', async () => {
-    if (dlg.returnValue === 'ok') {
-      const f = new FormData($('#pform', dlg));
-      const body = Object.fromEntries(f.entries());
-      body.openToAll = f.has('openToAll');
-      body.pmId = body.pmId ? Number(body.pmId) : null;
-      try {
-        await api(p.id ? 'PUT' : 'POST', p.id ? `/projects/${p.id}` : '/projects', body);
-        toast('Proyecto guardado');
-        route();
-      } catch (err) { fail(err); }
-    }
-    dlg.remove();
-  });
 }
 
 async function viewProject(id) {
-  const [{ items: projects }, { items: tasks }, { items: users }] = await Promise.all([
-    api('GET', '/projects'), api('GET', `/projects/${Number(id)}/tasks`), api('GET', '/users')]);
-  const p = projects.find((x) => x.id === Number(id));
-  if (!p) throw new Error('Proyecto no encontrado');
+  const [detail, { items: tasks }, cats] = await Promise.all([api('GET', `/projects/${Number(id)}`), api('GET', `/projects/${Number(id)}/tasks`), catalogs(true)]);
+  const { project: p, modules, members, resources } = detail;
+  const can = p.canManage;
+  const memberIds = new Set(members.map((m) => m.id));
+  const field = (label, value) => `<div><div class="small muted">${label}</div><div>${value || '—'}</div></div>`;
+  const consumed = p.soldHours ? p.actual / p.soldHours : null;
+
   $('#main').innerHTML = `
-    <div class="page-head"><div><h1>${esc(p.code)} · ${esc(p.name)}</h1><div class="sub">${esc(p.client || '')} · ${dot(p.category)}${esc(catLabel(p.category))}</div></div>
-      <div class="row"><a class="btn" href="#/proyectos">← Proyectos</a><button id="edit">Editar</button></div></div>
+    <div class="page-head"><div><h1>${esc(p.code)} · ${esc(p.name)}</h1>
+      <div class="sub">${esc(p.clientName || 'Sin cliente')} · ${esc(p.status)}${p.stage ? ` · ${esc(p.stage)}` : ''}</div></div>
+      <div class="row"><a class="btn" href="#/proyectos">← Proyectos</a>${can ? '<button class="primary" id="edit">Editar ficha</button>' : ''}</div></div>
+
+    <div class="card"><h2>Ficha del proyecto</h2><div class="facts">
+      ${field('Cliente', esc(p.clientName))}${field('Ejecutivo comercial', esc(p.salesExec))}${field('Gestor de proyecto', esc(p.pmName))}
+      ${field('Estatus', esc(p.status))}${field('Etapa', esc(p.stage))}${field('Presupuesto', p.budgetUsd != null ? money.format(p.budgetUsd) : '')}
+      ${field('Horas vendidas', p.soldHours != null ? fmtH(p.soldHours) : '')}${field('Horas planeadas (Project)', fmtH(p.planned))}
+      ${field('Horas reales', `${fmtH(p.actual)}${consumed != null ? ` · ${pct(consumed)} de lo vendido` : ''}`)}
+      ${field('Módulos', modules.map((m) => `<span class="chip">${esc(m.code)}</span>`).join(' '))}
+    </div></div>
+
+    ${resources.length ? `<div class="card"><h2>Recursos del plan de Project</h2>
+      <p class="small muted">Cada recurso del XML se cubre con un usuario activo. Al cambiarlo, sus tareas pasan al nuevo usuario y este obtiene acceso al proyecto.
+        Las reimportaciones respetan el reemplazo.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Recurso en Project</th><th>Correo en Project</th><th class="num">Tareas</th><th class="num">Horas plan</th><th>Lo cubre</th></tr></thead>
+        <tbody>${resources.map((r) => `<tr><td>${esc(r.name)}</td><td class="small">${esc(r.email || '—')}</td><td class="num">${r.tasks}</td><td class="num">${nf.format(r.planned)}</td>
+          <td>${can ? `<select data-resource="${r.id}" aria-label="Usuario que cubre ${esc(r.name)}">${optionList(cats.users, r.userId, { empty: '— Sin asignar —' })}</select>`
+            : esc(r.userName || 'Sin asignar')}${!r.userId ? ' <span class="over small">sin usuario</span>' : ''}</td></tr>`).join('')}</tbody>
+      </table></div></div>` : ''}
+
+    <div class="card"><h2>Acceso al proyecto</h2>
+      <p class="small muted">Solo estos usuarios ven el proyecto y pueden registrar horas en sus tareas (además del gestor y los administradores).</p>
+      ${can ? `<div class="member-grid">${cats.users.filter((u) => u.role !== 'admin').map((u) => `<label class="check"><input type="checkbox" name="member" value="${u.id}" ${memberIds.has(u.id) ? 'checked' : ''}> ${esc(u.name)}</label>`).join('')}</div>
+        <div class="row" style="margin-top:10px"><span class="spacer"></span><button id="save-members">Guardar acceso</button></div>`
+        : members.map((m) => `<span class="chip">${esc(m.name)}</span>`).join(' ') || '<p class="muted">Sin usuarios.</p>'}
+    </div>
+
     <div class="card"><h2>Tareas</h2><div class="table-wrap"><table>
-      <thead><tr><th>WBS</th><th>Tarea</th><th>Inicio</th><th>Fin</th><th>Recursos</th><th class="num">Plan</th><th class="num">Real</th><th>Avance de horas</th></tr></thead>
+      <thead><tr><th>WBS</th><th>Tarea</th><th>Inicio</th><th>Fin</th><th>Módulo</th><th>Recursos</th><th class="num">Plan</th><th class="num">Real</th><th>Avance</th></tr></thead>
       <tbody>${tasks.map((t) => {
         const c = t.planned ? t.actual / t.planned : null;
+        const moduleCell = t.isSummary ? '' : can && modules.length
+          ? `<select data-task-module="${t.id}" aria-label="Módulo de ${esc(t.name)}">${optionList(modules, t.moduleId, { label: (m) => m.code, empty: '—' })}</select>`
+          : esc(t.moduleCode || '—');
         return `<tr style="${t.active ? '' : 'opacity:.5'}${t.isSummary ? ';font-weight:600' : ''}">
         <td class="small muted">${esc(t.wbs || '')}</td>
-        <td style="padding-left:${10 + Math.max(t.level - 1, 0) * 14}px">${esc(t.name)}${t.active ? '' : ' <span class="small">(ya no está en el plan)</span>'}${t.category ? ` <span class="small muted">${dot(t.category)}${esc(catShort[t.category])}</span>` : ''}</td>
+        <td style="padding-left:${10 + Math.max(t.level - 1, 0) * 14}px">${esc(t.name)}${t.active ? '' : ' <span class="small">(ya no está en el plan)</span>'}${t.manual ? ' <span class="small muted">(manual)</span>' : ''}</td>
         <td class="small nowrap">${t.start ? fmtDate(t.start) : '—'}</td><td class="small nowrap">${t.finish ? fmtDate(t.finish) : '—'}</td>
-        <td class="small">${esc(t.resources || '')}</td>
+        <td>${moduleCell}</td><td class="small">${esc(t.resources || '')}</td>
         <td class="num">${t.isSummary ? '' : nf.format(t.planned)}</td><td class="num">${t.isSummary ? '' : nf.format(t.actual)}</td>
         <td>${!t.isSummary && c != null ? `<div class="progress ${c > 1 ? 'over' : ''}"><span style="width:${Math.min(c, 1) * 100}%"></span></div>` : ''}</td></tr>`;
-      }).join('') || '<tr><td colspan="8" class="muted">Sin tareas. Importa el plan desde Project o agrega tareas manualmente.</td></tr>'}</tbody>
-    </table></div></div>
-    <div class="card"><h2>Agregar tarea manual</h2>
+      }).join('') || '<tr><td colspan="9" class="muted">Sin tareas. Importa el plan desde Project o agrega tareas manualmente.</td></tr>'}</tbody>
+    </table></div>
+    ${can && !modules.length ? '<p class="small muted">Asigna módulos en la ficha del proyecto para poder clasificar sus tareas.</p>' : ''}</div>
+
+    ${can ? `<div class="card"><h2>Agregar tarea manual</h2>
       <form id="tform" class="form-grid">
         <label class="field">Nombre<input name="name" required></label>
         <label class="field">Inicio<input name="start" type="date"></label>
         <label class="field">Fin<input name="finish" type="date"></label>
         <label class="field">Horas planeadas<input name="planned" type="number" min="0" step="0.5"></label>
-        <label class="field">Rubro (si difiere del proyecto)<select name="category"><option value="">Igual que el proyecto</option>
-          ${state.categories.map((c) => `<option value="${c.key}">${esc(c.label)}</option>`).join('')}</select></label>
-        <label class="field">Asignar a<select name="userIds" multiple size="4">${users.filter((u) => u.active).map((u) => `<option value="${u.id}">${esc(u.name)}</option>`).join('')}</select></label>
+        <label class="field">Módulo<select name="moduleId">${optionList(modules, '', { label: (m) => `${m.code} · ${m.name}`, empty: '—' })}</select></label>
+        <label class="field">Asignar a<select name="userIds" multiple size="4">${optionList(cats.users.filter((u) => u.role !== 'admin'), '')}</select></label>
         <button class="primary" type="submit">Agregar</button>
       </form>
-      <p class="small muted">Si el proyecto viene de Project, lo recomendable es mantener el plan allá y reimportar: la reimportación desactiva las tareas que ya no estén en el archivo.</p>
-    </div>`;
-  $('#edit').onclick = () => projectDialog(p);
+      <p class="small muted">Si el proyecto viene de Project, lo recomendable es mantener el plan allá y reimportar.</p>
+    </div>` : ''}`;
+
+  if (!can) return;
+  $('#edit').onclick = () => projectDialog(p, modules);
+  $$('[data-resource]').forEach((sel) => { sel.onchange = async () => {
+    try {
+      await api('PUT', `/projects/${p.id}/resources/${sel.dataset.resource}`, { userId: sel.value ? Number(sel.value) : null });
+      toast('Recurso reasignado');
+      route();
+    } catch (err) { fail(err); }
+  }; });
+  $$('[data-task-module]').forEach((sel) => { sel.onchange = async () => {
+    try { await api('PUT', `/tasks/${sel.dataset.taskModule}`, { moduleId: sel.value ? Number(sel.value) : null }); toast('Módulo actualizado'); } catch (err) { fail(err); }
+  }; });
+  $('#save-members').onclick = async () => {
+    try {
+      await api('PUT', `/projects/${p.id}/members`, { userIds: $$('input[name=member]:checked').map((i) => Number(i.value)) });
+      toast('Acceso actualizado');
+      route();
+    } catch (err) { fail(err); }
+  };
   $('#tform').onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
     try {
       await api('POST', `/projects/${p.id}/tasks`, {
-        name: f.get('name'), start: f.get('start') || null, finish: f.get('finish') || null,
-        planned: Number(f.get('planned') || 0), category: f.get('category') || null, userIds: f.getAll('userIds').map(Number),
+        name: f.get('name'), start: f.get('start') || null, finish: f.get('finish') || null, planned: f.get('planned'),
+        moduleId: f.get('moduleId') ? Number(f.get('moduleId')) : null, userIds: f.getAll('userIds').map(Number),
       });
       toast('Tarea agregada');
       route();
     } catch (err) { fail(err); }
   };
+}
+
+// ---------- Administración ----------
+const ADMIN_TABS = [
+  ['tareas', 'Tareas administrativas'], ['festivos', 'Días festivos'], ['clientes', 'Clientes'], ['modulos', 'Módulos'], ['ajustes', 'Ajustes'],
+];
+
+async function viewAdmin(arg) {
+  const tab = ADMIN_TABS.some(([k]) => k === arg) ? arg : 'tareas';
+  const main = $('#main');
+  main.innerHTML = `
+    <div class="page-head"><div><h1>Administración</h1><div class="sub">Catálogos y reglas generales del sistema</div></div></div>
+    <nav class="tabs" aria-label="Secciones de administración">${ADMIN_TABS.map(([k, l]) => `<a href="#/administracion/${k}" class="${k === tab ? 'active' : ''}">${l}</a>`).join('')}</nav>
+    <div id="admin-body"><p class="muted">Cargando…</p></div>`;
+  const body = $('#admin-body');
+  const reload = () => viewAdmin(tab);
+  const act = async (fn, msg) => {
+    try { const r = await fn(); toast(typeof r === 'string' ? r : msg); catalogsCache = null; reload(); } catch (err) { fail(err); }
+  };
+
+  if (tab === 'tareas') {
+    const { items } = await api('GET', '/admin/tasks');
+    body.innerHTML = `<div class="card">
+      <p class="small muted">Tareas que no pertenecen a un proyecto. Las marcadas como <b>descuentan disponibilidad</b> (vacaciones, capacitación…) reducen las horas disponibles del consultor y no afectan su eficiencia; las demás cuentan como tiempo no facturable.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Tarea</th><th>Descuenta disponibilidad</th><th>Activa</th><th class="num">Horas registradas</th><th></th></tr></thead>
+        <tbody>${items.map((t) => `<tr data-id="${t.id}">
+          <td><input name="name" value="${esc(t.name)}" aria-label="Nombre"></td>
+          <td><input type="checkbox" name="reduces" ${t.reducesAvailability ? 'checked' : ''} aria-label="Descuenta disponibilidad"></td>
+          <td><input type="checkbox" name="active" ${t.active ? 'checked' : ''} aria-label="Activa"></td>
+          <td class="num">${nf.format(t.hours)}</td>
+          <td class="nowrap"><button data-save>Guardar</button> <button class="danger" data-del>Eliminar</button></td></tr>`).join('')}</tbody>
+        <tfoot><tr><td><input id="new-name" placeholder="Nueva tarea administrativa"></td><td><input type="checkbox" id="new-reduces" aria-label="Descuenta disponibilidad"></td><td></td><td></td>
+          <td><button class="primary" id="add">Agregar</button></td></tr></tfoot>
+      </table></div></div>`;
+    $('#add').onclick = () => act(() => api('POST', '/admin/tasks', { name: $('#new-name').value, reducesAvailability: $('#new-reduces').checked }), 'Tarea agregada');
+    $$('tr[data-id]', body).forEach((tr) => {
+      $('[data-save]', tr).onclick = () => act(() => api('PUT', `/admin/tasks/${tr.dataset.id}`, {
+        name: $('[name=name]', tr).value, reducesAvailability: $('[name=reduces]', tr).checked, active: $('[name=active]', tr).checked,
+      }), 'Tarea actualizada');
+      $('[data-del]', tr).onclick = () => {
+        if (!confirm('¿Eliminar esta tarea? Si ya tiene horas registradas solo se desactivará.')) return;
+        act(async () => {
+          const r = await api('DELETE', `/admin/tasks/${tr.dataset.id}`);
+          return r.deactivated ? 'Tenía horas registradas: se desactivó en lugar de eliminarse' : 'Tarea eliminada';
+        }, 'Listo');
+      };
+    });
+  }
+
+  if (tab === 'festivos') {
+    const params = new URLSearchParams(location.hash.split('?')[1] || '');
+    const year = params.get('anio') || state.today.slice(0, 4);
+    const { items } = await api('GET', `/admin/holidays?year=${year}`);
+    const years = [Number(year) - 1, Number(year), Number(year) + 1];
+    body.innerHTML = `<div class="card">
+      <div class="row" style="margin-bottom:12px">${years.map((y) => `<a class="btn" href="#/administracion/festivos?anio=${y}" ${String(y) === year ? 'style="font-weight:700;border-color:var(--accent)"' : ''}>${y}</a>`).join('')}</div>
+      <p class="small muted">Cada festivo en día hábil reduce las horas a cubrir de la semana y la disponibilidad (${fmtH(state.meta.weeklyHours / 5)} por día con la jornada general).</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Fecha</th><th>Día</th><th>Festivo</th><th></th></tr></thead>
+        <tbody>${items.map((h) => `<tr><td>${fmtDate(h.date)}</td><td>${dow(h.date)}</td><td>${esc(h.name)}</td>
+          <td><button class="danger" data-del="${h.date}">Eliminar</button></td></tr>`).join('') || `<tr><td colspan="4" class="muted">Sin festivos registrados para ${year}.</td></tr>`}</tbody>
+        <tfoot><tr><td><input type="date" id="h-date" aria-label="Fecha"></td><td></td><td><input id="h-name" placeholder="Nombre del festivo"></td>
+          <td><button class="primary" id="add">Agregar</button></td></tr></tfoot>
+      </table></div></div>`;
+    $('#add').onclick = () => act(() => api('POST', '/admin/holidays', { date: $('#h-date').value, name: $('#h-name').value }), 'Festivo guardado');
+    $$('[data-del]', body).forEach((b) => { b.onclick = () => act(() => api('DELETE', `/admin/holidays/${b.dataset.del}`), 'Festivo eliminado'); });
+  }
+
+  if (tab === 'clientes') {
+    const { items } = await api('GET', '/admin/clients');
+    body.innerHTML = `<div class="card">
+      <p class="small muted">Los proyectos solo pueden asignarse a clientes de esta lista.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Cliente</th><th>Ejecutivo comercial</th><th>Activo</th><th class="num">Proyectos</th><th></th></tr></thead>
+        <tbody>${items.map((c) => `<tr data-id="${c.id}">
+          <td><input name="name" value="${esc(c.name)}" aria-label="Nombre"></td><td><input name="salesExec" value="${esc(c.salesExec || '')}" aria-label="Ejecutivo comercial"></td>
+          <td><input type="checkbox" name="active" ${c.active ? 'checked' : ''} aria-label="Activo"></td><td class="num">${c.projects}</td>
+          <td class="nowrap"><button data-save>Guardar</button> <button class="danger" data-del ${c.projects ? 'disabled title="Tiene proyectos: desactívalo"' : ''}>Eliminar</button></td></tr>`).join('')}</tbody>
+        <tfoot><tr><td><input id="c-name" placeholder="Nombre del cliente"></td><td><input id="c-exec" placeholder="Ejecutivo comercial"></td><td></td><td></td>
+          <td><button class="primary" id="add">Agregar</button></td></tr></tfoot>
+      </table></div></div>`;
+    $('#add').onclick = () => act(() => api('POST', '/admin/clients', { name: $('#c-name').value, salesExec: $('#c-exec').value }), 'Cliente agregado');
+    $$('tr[data-id]', body).forEach((tr) => {
+      $('[data-save]', tr).onclick = () => act(() => api('PUT', `/admin/clients/${tr.dataset.id}`, {
+        name: $('[name=name]', tr).value, salesExec: $('[name=salesExec]', tr).value, active: $('[name=active]', tr).checked,
+      }), 'Cliente actualizado');
+      $('[data-del]', tr).onclick = () => confirm('¿Eliminar este cliente?') && act(() => api('DELETE', `/admin/clients/${tr.dataset.id}`), 'Cliente eliminado');
+    });
+  }
+
+  if (tab === 'modulos') {
+    const { items } = await api('GET', '/admin/modules');
+    body.innerHTML = `<div class="card">
+      <p class="small muted">Módulos vigentes que se pueden asignar a proyectos y a las tareas de cada proyecto.</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Clave</th><th>Nombre</th><th>Vigente</th><th class="num">Proyectos</th><th></th></tr></thead>
+        <tbody>${items.map((m) => `<tr data-id="${m.id}">
+          <td><input name="code" value="${esc(m.code)}" maxlength="20" style="width:110px" aria-label="Clave"></td><td><input name="name" value="${esc(m.name)}" aria-label="Nombre"></td>
+          <td><input type="checkbox" name="active" ${m.active ? 'checked' : ''} aria-label="Vigente"></td><td class="num">${m.projects}</td>
+          <td class="nowrap"><button data-save>Guardar</button> <button class="danger" data-del ${m.projects ? 'disabled title="En uso: desactívalo"' : ''}>Eliminar</button></td></tr>`).join('')}</tbody>
+        <tfoot><tr><td><input id="m-code" placeholder="Clave" maxlength="20" style="width:110px"></td><td><input id="m-name" placeholder="Nombre del módulo"></td><td></td><td></td>
+          <td><button class="primary" id="add">Agregar</button></td></tr></tfoot>
+      </table></div></div>`;
+    $('#add').onclick = () => act(() => api('POST', '/admin/modules', { code: $('#m-code').value, name: $('#m-name').value }), 'Módulo agregado');
+    $$('tr[data-id]', body).forEach((tr) => {
+      $('[data-save]', tr).onclick = () => act(() => api('PUT', `/admin/modules/${tr.dataset.id}`, {
+        code: $('[name=code]', tr).value, name: $('[name=name]', tr).value, active: $('[name=active]', tr).checked,
+      }), 'Módulo actualizado');
+      $('[data-del]', tr).onclick = () => confirm('¿Eliminar este módulo?') && act(() => api('DELETE', `/admin/modules/${tr.dataset.id}`), 'Módulo eliminado');
+    });
+  }
+
+  if (tab === 'ajustes') {
+    const settings = await api('GET', '/admin/settings');
+    body.innerHTML = `<div class="card" style="max-width:560px"><h2>Disponibilidad</h2>
+      <form id="sform" class="form-grid">
+        <label class="field">Horas semanales por recurso (lunes a viernes)<input name="weeklyHours" type="number" min="1" max="80" step="0.5" value="${settings.weeklyHours}" required></label>
+        <label class="check"><input type="checkbox" name="applyToAll"> Aplicar a todos los usuarios existentes</label>
+        <button class="primary" type="submit">Guardar</button>
+      </form>
+      <p class="small muted">Es la disponibilidad inicial de cada recurso y las horas que debe cubrir por semana. Los usuarios nuevos la toman por defecto;
+        se puede ajustar por persona en Usuarios (por ejemplo, medio tiempo).</p></div>`;
+    $('#sform').onsubmit = (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      act(async () => {
+        const r = await api('PUT', '/admin/settings', { weeklyHours: Number(f.get('weeklyHours')), applyToAll: f.has('applyToAll') });
+        state.meta.weeklyHours = r.weeklyHours;
+        if (r.updated) toast(`Se actualizaron ${r.updated} usuarios`);
+      }, 'Ajustes guardados');
+    };
+  }
 }
 
 // ---------- Importación ----------
@@ -699,36 +959,38 @@ function summaryHtml(res) {
   return res.results.map((s) => `
     <div class="notice info"><b>${res.dryRun ? 'Vista previa' : 'Importado'}: ${esc(s.project.code)} · ${esc(s.project.name)}</b>${s.created ? ' (proyecto nuevo)' : ''}<br>
       Tareas nuevas: ${s.tasksCreated} · actualizadas: ${s.tasksUpdated} · desactivadas: ${s.tasksDeactivated} · asignaciones: ${s.assignments}
-      ${s.matchedResources.length ? `<br>Recursos vinculados: ${s.matchedResources.map((m) => `${esc(m.resource)} → ${esc(m.user)}`).join(', ')}` : ''}
-      ${s.unmatchedResources.length ? `<br><b class="over">Recursos sin usuario en el sistema (sus asignaciones se omiten):</b> ${s.unmatchedResources.map((m) => esc(m.resource + (m.email ? ` <${m.email}>` : ''))).join(', ')}` : ''}
+      ${s.resources.filter((r) => r.user).length ? `<br>Recursos cubiertos: ${s.resources.filter((r) => r.user).map((m) => `${esc(m.resource)} → ${esc(m.user)}`).join(', ')}` : ''}
+      ${s.resources.filter((r) => !r.user).length ? `<br><b class="over">Recursos sin usuario:</b> ${s.resources.filter((r) => !r.user).map((m) => esc(m.resource + (m.email ? ` <${m.email}>` : ''))).join(', ')}
+        <br><span class="small">Se guardan en el proyecto; asígnales un usuario activo en la ficha del proyecto › Recursos del plan.</span>` : ''}
       ${s.warnings.length ? `<br>Advertencias: ${s.warnings.map(esc).join('; ')}` : ''}
     </div>`).join('') + (res.errors?.length ? `<div class="notice">${res.errors.map(esc).join('<br>')}</div>` : '');
 }
 
 async function viewImport() {
-  const [{ items: projects }, { items: log }] = await Promise.all([api('GET', '/projects'), api('GET', '/import/log')]);
+  const [{ items: projects }, { items: log }, cats] = await Promise.all([api('GET', '/projects'), api('GET', '/import/log'), catalogs(true)]);
   $('#main').innerHTML = `
     <div class="page-head"><div><h1>Importar actividades de Microsoft Project</h1>
       <div class="sub">Las tareas y asignaciones del plan se convierten en los renglones del timesheet de cada consultor.</div></div></div>
     <div class="grid-2">
       <div class="card"><h2>Archivo XML de Project</h2>
         <p class="small">En Project: <b>Archivo › Guardar como › Tipo: Formato XML (*.xml)</b>. Se leen tareas, fechas, trabajo planeado y asignaciones.
-          Los recursos se vinculan con los usuarios por <b>correo electrónico</b> (campo "Correo electrónico" del recurso) o, si no hay, por nombre exacto.</p>
+          Los recursos se guardan en el proyecto y se vinculan con los usuarios por <b>correo electrónico</b> o, si no hay, por nombre;
+          después puedes reemplazar cualquiera por otro usuario activo desde la ficha del proyecto.</p>
         <form id="xml-form" class="form-grid">
           <label class="field" style="grid-column:1/-1">Archivo<input type="file" name="file" accept=".xml,text/xml" required></label>
           <label class="field">Proyecto destino<select name="projectId"><option value="">Crear o detectar por nombre</option>
-            ${projects.filter((p) => !p.openToAll).map((p) => `<option value="${p.id}">${esc(p.code)} · ${esc(p.name)}</option>`).join('')}</select></label>
+            ${projects.filter((p) => p.canManage).map((p) => `<option value="${p.id}">${esc(p.code)} · ${esc(p.name)}</option>`).join('')}</select></label>
           <label class="field">Código (si es nuevo)<input name="code" placeholder="Ej. ERP-GID"></label>
-          <label class="field">Cliente<input name="client"></label>
-          <label class="field">Rubro<select name="category">${state.categories.map((c) => `<option value="${c.key}">${esc(c.label)}</option>`).join('')}</select></label>
+          <label class="field">Cliente (catálogo)<select name="clientId">${optionList(cats.clients, '', { empty: '— Sin cliente —' })}</select></label>
           <div class="row" style="grid-column:1/-1"><button type="button" data-dry="1">Vista previa</button><button class="primary" type="submit">Importar</button></div>
         </form>
         <div id="xml-result" style="margin-top:12px"></div>
       </div>
       <div class="card"><h2>CSV / Excel</h2>
         <p class="small">Para planes que no están en Project o exportados a Excel (guardar como CSV). Una fila por asignación; acepta fechas dd/mm/aaaa y separador coma o punto y coma.</p>
-        <pre class="code">proyecto,codigo_proyecto,cliente,rubro,tarea,inicio,fin,horas_planeadas,recurso_email
-Diagnóstico BI,BI-DIAG,Retail SA,facturable,Entrevistas,07/09/2026,18/09/2026,24,ana@fortia.com.mx</pre>
+        <pre class="code">proyecto,codigo_proyecto,cliente,tarea,inicio,fin,horas_planeadas,recurso_email
+Diagnóstico BI,BI-DIAG,Retail Demo,Entrevistas,07/09/2026,18/09/2026,24,ana@fortia.com.mx</pre>
+        <p class="small muted">El cliente debe existir en el catálogo de Administración; si no, el proyecto queda sin cliente y se avisa.</p>
         <form id="csv-form" class="form-grid">
           <label class="field" style="grid-column:1/-1">Archivo<input type="file" name="file" accept=".csv,text/csv" required></label>
           <div class="row" style="grid-column:1/-1"><button type="button" data-dry="1">Vista previa</button><button class="primary" type="submit">Importar</button></div>
@@ -757,7 +1019,7 @@ Diagnóstico BI,BI-DIAG,Retail SA,facturable,Entrevistas,07/09/2026,18/09/2026,2
     $('[data-dry]', form).onclick = () => run(true);
   };
   wire('#xml-form', '#xml-result', '/import/msproject', (f, text) => ({
-    xml: text, projectId: f.projectId.value || null, code: f.code.value || null, client: f.client.value || null, category: f.category.value,
+    xml: text, projectId: f.projectId.value || null, code: f.code.value || null, clientId: f.clientId.value ? Number(f.clientId.value) : null,
   }));
   wire('#csv-form', '#csv-result', '/import/csv', (f, text) => ({ csv: text }));
 }
@@ -770,8 +1032,8 @@ async function viewUsers() {
     <div class="page-head"><div><h1>Usuarios</h1><div class="sub">El correo debe coincidir con el del recurso en Project para vincular asignaciones${state.auth.microsoft ? ' y con la cuenta de Microsoft 365 para entrar' : ''}.</div></div>
       <button class="primary" id="new-user">Nuevo usuario</button></div>
     <div class="card"><div class="table-wrap"><table>
-      <thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th>Área</th><th>Líder</th><th class="num">Capacidad</th><th>Cargabilidad</th><th>Acceso</th><th>Estatus</th><th></th></tr></thead>
-      <tbody>${items.map((u) => `<tr style="${u.active ? '' : 'opacity:.55'}"><td>${esc(u.name)}</td><td>${esc(u.email)}</td><td>${esc(u.role)}</td><td>${esc(u.area || '')}</td>
+      <thead><tr><th>Nombre</th><th>Correo</th><th>Rol</th><th>Área</th><th>Aprueba sus horas</th><th class="num">Horas semanales</th><th>Eficiencia</th><th>Acceso</th><th>Estatus</th><th></th></tr></thead>
+      <tbody>${items.map((u) => `<tr style="${u.active ? '' : 'opacity:.55'}"><td>${esc(u.name)}</td><td>${esc(u.email)}</td><td>${esc(roleLabel(u.role))}</td><td>${esc(u.area || '')}</td>
         <td>${esc(byId.get(u.managerId)?.name || '')}</td><td class="num">${fmtH(u.weeklyCapacity)}</td><td>${u.tracksTime ? 'Cuenta' : 'No cuenta'}</td>
         <td class="small">${u.authProvider === 'microsoft' ? 'Microsoft 365' : 'Contraseña'}<div class="muted">${u.lastLoginAt ? `Último: ${esc(u.lastLoginAt.slice(0, 10))}` : 'Nunca ha entrado'}</div></td>
         <td>${u.active ? 'Activo' : 'Inactivo'}</td><td><button class="ghost" data-edit="${u.id}">Editar</button></td></tr>`).join('')}</tbody>
@@ -787,13 +1049,13 @@ function userDialog(u, all) {
     <div class="form-grid">
       <label class="field">Nombre<input name="name" required value="${esc(u.name || '')}"></label>
       <label class="field">Correo<input name="email" type="email" required value="${esc(u.email || '')}"></label>
-      <label class="field">Rol<select name="role">${['consultor', 'lider', 'admin'].map((r) => `<option ${r === (u.role || 'consultor') ? 'selected' : ''}>${r}</option>`).join('')}</select></label>
+      <label class="field">Rol<select name="role">${['consultor', 'lider', 'admin'].map((r) => `<option value="${r}" ${r === (u.role || 'consultor') ? 'selected' : ''}>${esc(roleLabel(r))}</option>`).join('')}</select></label>
       <label class="field">Área<input name="area" value="${esc(u.area || '')}"></label>
-      <label class="field">Líder (aprueba sus horas)<select name="managerId"><option value="">—</option>${leaders.map((l) => `<option value="${l.id}" ${l.id === u.managerId ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
-      <label class="field">Capacidad semanal (h)<input name="weeklyCapacity" type="number" min="0" max="80" step="0.5" value="${u.weeklyCapacity ?? 40}"></label>
+      <label class="field">Gestor que aprueba sus horas<select name="managerId"><option value="">—</option>${leaders.map((l) => `<option value="${l.id}" ${l.id === u.managerId ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
+      <label class="field">Horas semanales<input name="weeklyCapacity" type="number" min="0" max="80" step="0.5" value="${u.weeklyCapacity ?? state.meta.weeklyHours}"></label>
       ${state.auth.local ? `<label class="field">${u.id ? 'Nueva contraseña (opcional)' : 'Contraseña inicial'}<input name="password" type="password" minlength="8" ${u.id ? '' : 'required'} autocomplete="new-password"></label>` : ''}
     </div>
-    <p><label class="check"><input type="checkbox" name="tracksTime" ${u.tracksTime !== false ? 'checked' : ''}> Cuenta para capacidad y cargabilidad</label>
+    <p><label class="check"><input type="checkbox" name="tracksTime" ${u.tracksTime !== false ? 'checked' : ''}> Cuenta para disponibilidad y eficiencia</label>
       <label class="check" style="margin-left:14px"><input type="checkbox" name="active" ${u.active !== false ? 'checked' : ''}> Activo</label>
       ${u.linked ? '<br><label class="check" style="margin-top:8px"><input type="checkbox" name="unlinkMicrosoft"> Desvincular cuenta de Microsoft 365 (si la cuenta se recreó en Entra ID)</label>' : ''}</p>
     <div class="row"><span class="spacer"></span><button value="cancel" formnovalidate>Cancelar</button><button class="primary" value="ok">Guardar</button></div></form>`;

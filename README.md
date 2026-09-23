@@ -2,7 +2,7 @@
 
 Sistema web para que los consultores de Fortia registren sus horas **por semana** contra las
 tareas que tienen asignadas en **Microsoft Project**, con flujo de aprobación e indicadores de
-**cargabilidad** y distribución de horas por rubro.
+**eficiencia** (horas facturables / disponibilidad), carga a proyectos y carga administrativa.
 
 ## Probar sin instalar nada (GitHub Codespaces)
 
@@ -48,7 +48,7 @@ Sin las variables `ENTRA_*`, el sistema funciona con usuario y contraseña local
 | `PORT` | `3000` | Puerto HTTP |
 | `DB_FILE` | `data/timesheet.db` | Archivo SQLite |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | — | Administrador inicial |
-| `TARGET_UTILIZATION` | `0.75` | Meta de cargabilidad mostrada en los indicadores |
+| `TARGET_EFFICIENCY` | `0.75` | Meta de eficiencia mostrada en los indicadores |
 | `NODE_ENV=production` | — | Cookies de sesión `Secure` (requiere HTTPS) |
 | `APP_BASE_URL`, `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `ENTRA_CLIENT_SECRET` | — | Activan el acceso con Microsoft 365 |
 | `AUTH_ALLOWED_DOMAINS` | `fortia.com.mx` | Dominios de correo que pueden entrar |
@@ -58,37 +58,50 @@ Sin las variables `ENTRA_*`, el sistema funciona con usuario y contraseña local
 
 ## Cómo funciona
 
-1. **El plan se importa desde Project.** Un líder o admin sube el XML del proyecto
-   (*Archivo › Guardar como › Formato XML*). Se leen tareas, jerarquía (WBS), fechas, trabajo
-   planeado y asignaciones. Los recursos de Project se vinculan con los usuarios **por correo
-   electrónico** (campo *Correo electrónico* del recurso) o, si no lo tiene, por nombre.
-   Siempre hay **vista previa** antes de escribir, y reimportar es seguro: actualiza tareas,
-   reemplaza asignaciones y desactiva (no borra) las tareas que ya no vienen en el archivo.
-   También se acepta CSV (exportado de Excel) para planes que no viven en Project.
-2. **El consultor captura su semana.** La pantalla *Mi semana* precarga las tareas que Project le
-   asigna con fechas dentro de esa semana. Puede agregar otras tareas suyas o actividades internas
-   abiertas a todos (preventa, capacitación, juntas, administrativo, vacaciones, permisos, festivos).
-   No puede cargar horas a tareas que no le asignaron. Validaciones: máx. 24 h por día, cuartos de hora.
-3. **Envío y aprobación.** El consultor envía; su líder directo (campo *Líder* del usuario) aprueba,
-   rechaza con motivo o reabre. Un timesheet enviado o aprobado queda bloqueado.
-4. **Indicadores.** Solo cuentan timesheets enviados y aprobados (los borradores se pueden incluir
-   con un filtro). Consultor ve lo suyo, líder ve a su equipo, admin ve todo.
+1. **Administración (admin).** Catálogos que usa el resto del sistema:
+   - *Tareas administrativas*: todo lo que no va a un proyecto. Cada una se marca si **descuenta
+     disponibilidad** (por defecto: Vacaciones y permisos, Documentación IA, Innovación, Apoyo a Soporte,
+     Capacitación). Si una tarea ya tiene horas, "eliminar" la desactiva para no perder historia.
+   - *Días festivos* por año (vienen cargados los oficiales de 2026 en el demo).
+   - *Clientes* (nombre y ejecutivo comercial): los proyectos solo pueden usar clientes de esta lista.
+   - *Módulos vigentes* (AP, NOM, T&A, CH, GT, KIO, APP, R&S, CAP, EXP, COM, COMPULSA, EVD, PCS).
+   - *Ajustes*: horas semanales por recurso (default **45 h**, lunes a viernes), con opción de aplicarlas a todos.
+2. **Importación desde Project (gestor o admin).** Se sube el XML (*Archivo › Guardar como › XML*).
+   Se leen tareas, WBS, fechas, trabajo planeado y asignaciones. **Todos los recursos se guardan**
+   en el proyecto; cada uno se liga a un usuario por correo o nombre, y desde la ficha del proyecto se
+   puede **reemplazar por cualquier usuario activo** (el reemplazo sobrevive a las reimportaciones).
+   Quien cubre un recurso obtiene acceso al proyecto y sus tareas.
+3. **Ficha del proyecto (gestor del proyecto o admin).** Nombre, código, cliente (catálogo), ejecutivo
+   comercial, gestor (usuarios con rol *Gestor de proyecto*), estatus (Prerrequisitos, Por asignar,
+   Asignado, Entregado, Activo, Estabilización, Gestionando pase a soporte, Suspendido), etapa
+   (Preparación, Planificación y estimación, Implementación, Lanzamiento), horas vendidas, presupuesto
+   USD y módulos. Cada tarea se clasifica con uno de los módulos del proyecto.
+4. **Acceso.** Cada usuario solo ve los proyectos a los que tiene acceso (se administra en la ficha).
+   El gestor ve los suyos y el admin todos. En proyectos *Entregados* o *Suspendidos* ya no se registran horas.
+5. **Mi semana (consultor).** Semanas de **lunes a viernes**, con navegación a semanas anteriores y
+   posteriores. Se precargan las tareas asignadas en Project para esas fechas; se pueden agregar otras
+   tareas de proyectos con acceso o tareas administrativas. Horas a cubrir = horas semanales − festivos
+   (p. ej. 45 − 9 = 36 h en la semana del 16 de septiembre).
+6. **Aprobación.** El consultor envía; el gestor que aprueba sus horas (campo del usuario) aprueba,
+   rechaza con motivo o reabre.
 
 ## Indicadores
 
 | Indicador | Fórmula |
 |---|---|
-| Capacidad | `capacidad semanal / 5 × días hábiles del periodo` (lun–vie) |
-| **Cargabilidad** | `horas facturables / capacidad` |
-| **Cargabilidad neta** | `horas facturables / (capacidad − horas de ausencia)` |
-| Ocupación | `horas totales registradas / capacidad` |
-| Horas por rubro | facturable, preventa, interno, capacitación, administrativo, ausencia |
-| Plan vs. real | horas reales acumuladas vs. trabajo planeado en Project, por proyecto y tarea |
+| Capacidad | `horas semanales / 5 × días hábiles (lun–vie) del periodo` |
+| **Disponibilidad** | `capacidad − festivos − horas en tareas administrativas que descuentan disponibilidad` |
+| Horas facturables / carga a proyectos | horas registradas en proyectos |
+| Carga administrativa | horas en tareas administrativas (desglosadas por tarea) |
+| **Eficiencia** | `horas facturables / disponibilidad`, en porcentaje |
+| Horas sin registrar | `capacidad − festivos − horas registradas` |
+| Vendido vs. real | horas reales acumuladas contra horas vendidas y planeadas en Project |
+| Horas por módulo | horas de proyecto según el módulo de cada tarea |
 | Cumplimiento | semanas cerradas con timesheet enviado o aprobado / semanas esperadas |
 
-El rubro de una hora es el de su tarea (si se definió) o el de su proyecto. Los usuarios marcados
-como *no cuenta para cargabilidad* (p. ej. el admin) no afectan capacidad ni cargabilidad.
-Todo el detalle se exporta a CSV (compatible con Excel/Power BI).
+Solo cuentan timesheets enviados y aprobados (los borradores se incluyen con un filtro). Filtros por
+periodo, consultor, cliente y proyecto. Los usuarios marcados como *no cuenta para disponibilidad*
+(p. ej. el admin) no afectan los totales. Todo el detalle se exporta a CSV.
 
 ## Integración con Project: lo que hay y lo que falta
 
@@ -127,7 +140,6 @@ test/                  pruebas (node --test)
 
 ## Pendientes recomendados antes de producción
 
-- **Calendario de días festivos** para que la capacidad no los cuente como hábiles.
 - **Conector a Planner Premium** (Dataverse) para dejar de subir el XML a mano.
 - **Acceso de externos** como invitados B2B con un rol limitado (ver docs/microsoft-365.md).
 - Recordatorio por correo o Teams cuando la semana no se envía.
